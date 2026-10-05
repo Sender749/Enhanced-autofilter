@@ -33,9 +33,9 @@ API_ID = int(os.environ.get("API_ID", "29453152"))
 API_HASH = os.environ.get("API_HASH", "2302adc174dbc954ae5081eda5131166")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMINS = _int_list("ADMINS", "6541030917 1052054451")
-DATABASE_URI = os.environ.get("DATABASE_URI", "mongodb+srv://gd3251791_db_user:GDPQbmyXAEFDGpbL@cluster0.6jxsnxc.mongodb.net/?appName=Cluster0")
-DATABASE_NAME = os.environ.get("DATABASE_NAME", "AutofilterBot")
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "files")
+DATABASE_URI = os.environ.get("DATABASE_URI", "mongodb+srv://autofilter:filter@cluster0.iitbepl.mongodb.net/?appName=Cluster0")
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "Cluster0")
+COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "navex")
 ENABLE_PM_SEARCH = _bool("ENABLE_PM_SEARCH", True)
 RESULTS_PER_PAGE = int(os.environ.get("RESULTS_PER_PAGE", "8"))
 MOVIE_GROUP_LINK = os.environ.get("MOVIE_GROUP_LINK", "https://t.me/Navex_Movies")
@@ -43,21 +43,22 @@ WELCOME_VIDEO = os.environ.get("WELCOME_VIDEO", "").strip()
 RESTART_NOTIFY = _bool("RESTART_NOTIFY", True)
 SUGGESTION_TIMEOUT = int(os.environ.get("SUGGESTION_TIMEOUT", "120"))  # seconds
 MOVIE_UPDATE_NOTIFICATION = _bool("MOVIE_UPDATE_NOTIFICATION", True)  # Notification On/Off
+OWNER_LINK = os.environ.get("OWNER_LINK", "https://t.me/Navex_69")
 
 # ── Channels ─────────────────────────────────────────────────────
 # database channel list (use space to seprate)
-CHANNELS = _int_list("CHANNELS", "-1002407564854")
-log_channel = os.environ.get("LOG_CHANNEL", "-1003073036876")
+CHANNELS = _int_list("CHANNELS", "-1002066489726 -1002445793312 -1002407564854 -1002467109334 -1003941255241")
+log_channel = os.environ.get("LOG_CHANNEL", "-1002262450769")
 LOG_CHANNEL = int(log_channel) if log_channel and _id_pattern.match(log_channel) else None
-request_channel = os.environ.get("REQUEST_CHANNEL", "-1003073036876")
+request_channel = os.environ.get("REQUEST_CHANNEL", "-1002380553501")
 REQUEST_CHANNEL = int(request_channel) if request_channel and _id_pattern.match(request_channel) else None
-not_found_channel = os.environ.get("NOT_FOUND_FILE_CHANNEL", "-1003073036876")
+not_found_channel = os.environ.get("NOT_FOUND_FILE_CHANNEL", "-1002279624678")
 NOT_FOUND_FILE_CHANNEL = int(not_found_channel) if not_found_channel and _id_pattern.match(not_found_channel) else None
-movie_update_channel = os.environ.get("MOVIE_UPDATE_CHANNEL", "-1003073036876")
+movie_update_channel = os.environ.get("MOVIE_UPDATE_CHANNEL", "-1002333962739")
 MOVIE_UPDATE_CHANNEL = int(movie_update_channel) if movie_update_channel and _id_pattern.match(movie_update_channel) else None
-fetch_update_channels = os.environ.get("FETCH_MOVIE_UPDATE", "-1003073036876")  # Movie Update Fetch Channels (space-separated)
-FETCH_MOVIE_UPDATE = _int_list("FETCH_MOVIE_UPDATE", "-1003073036876")  # List of channel IDs for auto-fetch
-bin_channel = os.environ.get("BIN_CHANNEL", "-1003073036876") # for stream and download link
+fetch_update_channels = os.environ.get("FETCH_MOVIE_UPDATE", "-1002028282135")  # Movie Update Fetch Channels (space-separated)
+FETCH_MOVIE_UPDATE = _int_list("FETCH_MOVIE_UPDATE", "-1002028282135")  # List of channel IDs for auto-fetch
+bin_channel = os.environ.get("BIN_CHANNEL", "-1002262450769") # for stream and download link
 BIN_CHANNEL = int(bin_channel) if bin_channel and _id_pattern.match(bin_channel) else None
 
 START_BUTTONS = [
@@ -85,7 +86,6 @@ WELCOME_DELETE_AFTER = int(os.environ.get("WELCOME_DELETE_AFTER", "120"))
 
 # ── Premium page ─────────────────────────────────────────────────────────────
 PREMIUM_PHOTO = os.environ.get("PREMIUM_PHOTO", "").strip()
-OWNER_LINK = os.environ.get("OWNER_LINK", "https://t.me/Navex_69")
 TELEGRAPH_PROVIDER = os.environ.get("TELEGRAPH_PROVIDER", "auto").strip().lower()
 
 # ── Automatic poster fetch (TMDB primary, OMDb fallback) ───────────────────

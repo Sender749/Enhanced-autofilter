@@ -63,16 +63,14 @@ BIN_CHANNEL = int(bin_channel) if bin_channel and _id_pattern.match(bin_channel)
 
 START_BUTTONS = [
     [("⇆ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘs ⇆", "url", "http://t.me/{bot}?startgroup=start")],
-    [
-        ("• Movie Group", "url", "https://t.me/Navex_Movies"),
-        ("• Pʀᴇᴍɪᴜᴍ", "callback", "premium"),
-    ],
+    [("• Movie Group", "url", "https://t.me/Navex_Movies"), ("• Pʀᴇᴍɪᴜᴍ", "callback", "premium")],
+    [("• Support Group", "url", "https://t.me/Navexdisscussion")],
 ]
 
 WELCOME_BUTTONS = [
-    [("⇆ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘs ⇆", "url", "http://t.me/{bot}?startgroup=start")],
+    [("⇆ Support Group ⇆", "url", "https://t.me/Navexdisscussion")],
  #   [
- #       ("• Movie Group", "url", "https://t.me/Navex_Movies"),
+ #       ("• Support Group", "url", "https://t.me/Navexdisscussion"),
  #       ("• Bot PM", "url", "http://t.me/{bot}?start=start"),
  #   ],
 ]

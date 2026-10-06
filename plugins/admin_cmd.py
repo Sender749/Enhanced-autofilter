@@ -15,9 +15,7 @@ from strings import SETTINGS_MAIN_TXT
 ADMIN_PANEL_TXT = """<b>🔧 Admin Commands Panel</b>
 
 <b>📋 Available Commands:</b>
-
-<b>• /admin</b> - Show this admin commands panel
-<b>• /settings</b> - Open admin settings panel (autofilter, PM filter, welcome, premium…)
+<b>• /aliases</b> - List search aliases
 
 <b>📚 Indexing & Stats:</b>
 <b>• /index</b> - Index an entire channel (auto + manual)

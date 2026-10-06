@@ -15,6 +15,7 @@ from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT
 from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
 )
+from database.alias_db import alias_key, create_miss, set_miss_message
 from database.settings_db import get_settings
 from database.trending_db import record_search, title_of
 from filterwords import apply_filter_words
@@ -223,7 +224,23 @@ async def _schedule_auto_request(bot, status_message, query: str, user_id: int):
                     f"🆔 ID: <code>{user_id}</code>\n"
                     f"🔍 Query: <code>{html.escape(query)}</code>"
                 )
-                await bot.send_message(chat_id=NOT_FOUND_FILE_CHANNEL, text=text)
+                # Fix / Ignore buttons let an admin turn this miss into a search
+                # alias (handled in plugins/alias_fix.py). If the DB write fails
+                # the report is still sent, just without buttons.
+                markup, miss_id = None, None
+                try:
+                    key = alias_key(query)
+                    if key:
+                        miss_id = await create_miss(query, key, user_id, text)
+                        markup = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✏️ Fix", callback_data=f"nfa#fix#{miss_id}"),
+                            InlineKeyboardButton("🚫 Ignore", callback_data=f"nfa#ign#{miss_id}"),
+                        ]])
+                except Exception:
+                    logger.exception("Could not store not-found report")
+                sent = await bot.send_message(chat_id=NOT_FOUND_FILE_CHANNEL, text=text, reply_markup=markup)
+                if miss_id:
+                    await set_miss_message(miss_id, sent.id)
             except Exception:
                 pass  # Fail silently if user can't be fetched or message fails
     

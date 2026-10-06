@@ -758,7 +758,7 @@ async def _search_by_tags(query: str) -> list:
     return results[:_MAX_FETCH]
 
 
-async def search_files(query: str) -> list:
+async def search_files(query: str, use_alias: bool = True) -> list:
     """
     Stage 1 search. Deliberately simple and strict:
       1. Pull any trailing season/episode/year/quality/language tag off the
@@ -792,6 +792,13 @@ async def search_files(query: str) -> list:
         # No title left to match — if the query is just tags (language, year,
         # resolution, quality), search by those instead of returning nothing.
         return await _search_by_tags(query)
+
+    if use_alias:
+        # Admin-approved alias ("hindi madium" -> "hindi medium"). Only the
+        # title is swapped; tags from the query are still applied below.
+        # Imported here because alias_db itself imports this module.
+        from database.alias_db import get_alias
+        query_key = await get_alias(query_key) or query_key
 
     words = _tokenize(query_key)
     if not words:

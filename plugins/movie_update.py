@@ -1061,6 +1061,7 @@ async def manual_movie_update(bot, message):
             tag=primary_tag,
             filename=e(display_title),
             genres=e(genres),
+            ott=e(pseudo_doc.get("ott_platform") or "N/A"),
             quality=e(", ".join(pseudo_doc["_qualities"]) or "N/A"),
             resolution=e(", ".join(pseudo_doc["_resolutions"]) or "N/A"),
             language=e(", ".join(pseudo_doc["_languages"]) or "N/A"),

@@ -22,7 +22,7 @@ from filterwords import apply_filter_words
 from linkcheck import has_link
 from poster import fetch_poster
 from spellcheck import fuzzy_correct, suggest_titles
-from utils import temp, human_size
+from utils import temp, human_size, format_duration
 from strings import (
     NOT_FOUND_TXT, RESULT_HEADER_TXT, RESULT_HEADER_CORRECTED_TXT, POSTER_CAPTION_TXT,
     SEARCH_EXPIRED_TXT, QUERY_AUTODELETE_NOTE, FILTER_LABELS, FILTER_MENU_TXT,
@@ -413,12 +413,29 @@ def _search_filter(_, __, message):
 search_filter = filters.create(_search_filter)
 
 
+_DELETE_AT: dict = {}   # (chat_id, message_id) -> time.monotonic() deadline
+
+
 async def _schedule_delete(message, seconds: int):
+    key = (message.chat.id, message.id)
+    if seconds > 0:
+        _DELETE_AT[key] = time.monotonic() + seconds
     await asyncio.sleep(seconds)
+    _DELETE_AT.pop(key, None)
     try:
         await message.delete()
     except RPCError:
         pass
+
+
+def _remaining_note(message) -> str:
+    """"This message will self-destruct in ..." for a message that already has a
+    delete scheduled (used when its text is edited later). "" if none scheduled."""
+    deadline = _DELETE_AT.get((message.chat.id, message.id))
+    if not deadline:
+        return ""
+    left = int(deadline - time.monotonic())
+    return QUERY_AUTODELETE_NOTE.format(duration=format_duration(max(left, 1)))
 
 
 async def _status_update(message, text: str, markup=None):
@@ -448,7 +465,7 @@ async def _deliver_results(message, resolved_query: str, results: list,
 
     text, markup = _render(key, entry, offset=0)
     if settings["query_autodelete_enabled"]:
-        text += QUERY_AUTODELETE_NOTE.format(seconds=settings["query_autodelete_seconds"])
+        text += QUERY_AUTODELETE_NOTE.format(duration=format_duration(settings["query_autodelete_seconds"]))
 
     to_delete = []
     if poster:
@@ -562,10 +579,19 @@ async def handle_search(bot, message):
     rows.extend(_action_rows(query, user_id))
     markup = InlineKeyboardMarkup(rows)
 
-    if suggestions:
-        await _status_update(status, SUGGESTIONS_HEADER_TXT.format(query=html.escape(query)), markup)
-    else:
-        await _status_update(status, NOT_FOUND_TXT.format(query=html.escape(query)), markup)
+    text = (
+        SUGGESTIONS_HEADER_TXT.format(query=html.escape(query)) if suggestions
+        else NOT_FOUND_TXT.format(query=html.escape(query))
+    )
+    autodelete = settings["query_autodelete_enabled"]
+    if autodelete:
+        text += QUERY_AUTODELETE_NOTE.format(duration=format_duration(settings["query_autodelete_seconds"]))
+    status = await _status_update(status, text, markup)
+    if autodelete:
+        # Same timer as the result messages: the "not found" / suggestions / Google /
+        # Request-to-admin message disappears on its own. If the user taps a
+        # suggestion or Request, this same message is edited, and still vanishes.
+        asyncio.create_task(_schedule_delete(status, settings["query_autodelete_seconds"]))
 
     # Track for auto-request timeout
     if REQUEST_CHANNEL and user_id and user_id not in ADMINS:
@@ -666,7 +692,7 @@ async def suggestion_clicked(_, query):
     results = await search_files(title)
     if not results:
         await query.message.edit_text(
-            SUGGESTION_NOT_FOUND_TXT.format(title=html.escape(title)),
+            SUGGESTION_NOT_FOUND_TXT.format(title=html.escape(title)) + _remaining_note(query.message),
             reply_markup=InlineKeyboardMarkup(_action_rows(title, query.from_user.id)),
         )
         return
@@ -718,7 +744,7 @@ async def request_button_clicked(bot, query):
         # The request is in — the auto "file not found" notice is no longer needed.
         _SUGGESTION_TRACKER.pop(query.message.id, None)
         await query.message.edit_text(
-            REQUEST_SENT_TXT.format(query=html.escape(search_query)),
+            REQUEST_SENT_TXT.format(query=html.escape(search_query)) + _remaining_note(query.message),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✨ View Your Request ✨", url=sent.link)]
             ])

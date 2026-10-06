@@ -5,7 +5,7 @@ import os
 import time
 
 from pyrogram import Client, filters, enums
-from pyrogram.errors import RPCError, UserNotParticipant
+from pyrogram.errors import RPCError, UserNotParticipant, ListenerTimeout, ListenerStopped
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import ADMINS, MOVIE_UPDATE_CHANNEL
@@ -19,7 +19,7 @@ from database.premium_db import list_premium, count_premium
 from database.filters_db import count_by_channel, export_all_captions, backfill_word_index
 from plugins.force_sub import is_bot_admin_in
 from shortlink import make_short_link
-from utils import mask_secret, IST
+from utils import mask_secret, IST, readable_time, format_duration, parse_duration
 from strings import (
     SETTINGS_MAIN_TXT, AUTOFILTER_INFO_TXT, PM_FILTER_INFO_TXT, WELCOME_INFO_TXT,
     FSUB_MENU_HEADER, FSUB_MENU_EMPTY, FSUB_ADD_PROMPT, FSUB_ADD_NOT_CHANNEL,
@@ -32,7 +32,7 @@ from strings import (
     INDEX_MENU_HEADER, INDEX_MENU_EMPTY, INDEX_MENU_ROW,
     INDEX_ADD_PROMPT, INDEX_ADD_NOT_CHANNEL, INDEX_ADD_NOT_ADMIN,
     INDEX_ADD_OK, INDEX_ADD_FAILED, INDEX_REMOVED_TXT,
-    ASK_NUMBER_TIMEOUT, ASK_NUMBER_INVALID,
+    ASK_NUMBER_TIMEOUT, ASK_NUMBER_RETRY, ASK_BACK_BTN,
     ASK_QUERY_DELAY_PROMPT, QUERY_DELAY_SET_TXT,
     ASK_FILE_DELAY_PROMPT, FILE_DELAY_SET_TXT,
     ASK_FILE_LIMIT_PROMPT, FILE_LIMIT_SET_TXT, FILE_LIMIT_NEEDS_VERIFY_NOTE,
@@ -67,7 +67,7 @@ def build_main_menu(settings: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(_status(settings["welcome_enabled"]), callback_data="cfg#tg#welcome"),
          InlineKeyboardButton("👋 Welcome Msg", callback_data="cfg#info#welcome")],
         [InlineKeyboardButton("📚 Index", callback_data="cfg#m#index"),
-         InlineKeyboardButton("➕ Add Channel", callback_data="cfg#idx_add")],
+         InlineKeyboardButton("➕ Add Channel", callback_data="cfg#idx_add#main")],
         [InlineKeyboardButton(_status(settings["force_sub_enabled"]), callback_data="cfg#tg#fsub"),
          InlineKeyboardButton("📢 Force-Subscribe", callback_data="cfg#m#fsub")],
         [InlineKeyboardButton(_status(settings["premium_enabled"]), callback_data="cfg#tg#premium"),
@@ -81,12 +81,12 @@ def build_main_menu(settings: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("📄 Result Format", callback_data="cfg#info#resmode")],
         [InlineKeyboardButton(_status(settings["query_autodelete_enabled"]), callback_data="cfg#tg#query_ad"),
          InlineKeyboardButton(
-             f"⏳ Query Auto-Delete ({settings['query_autodelete_seconds']}s)",
+             f"⏳ Query Auto-Delete ({readable_time(settings['query_autodelete_seconds'])})",
              callback_data="cfg#ask#query_delay",
          )],
         [InlineKeyboardButton(_status(settings["file_autodelete_enabled"]), callback_data="cfg#tg#file_ad"),
          InlineKeyboardButton(
-             f"🗑 File Auto-Delete ({settings['file_autodelete_seconds']}s)",
+             f"🗑 File Auto-Delete ({readable_time(settings['file_autodelete_seconds'])})",
              callback_data="cfg#ask#file_delay",
          )],
         [InlineKeyboardButton(_status(settings["file_limit_enabled"]), callback_data="cfg#tg#filelimit"),
@@ -291,6 +291,17 @@ async def settings_callback(bot, query):
         await query.message.edit_text(SETTINGS_MAIN_TXT, reply_markup=build_main_menu(settings))
         return
 
+    if action == "cancel":
+        # Back/Cancel pressed on an "send me a value" prompt: stop waiting for the
+        # admin's reply; the waiting task (below) then redraws the right panel.
+        await query.answer()
+        key = (query.message.chat.id, query.from_user.id)
+        if key in _PENDING:
+            await bot.stop_listening(chat_id=key[0], user_id=key[1])
+        else:  # stale prompt (e.g. after a restart) — nothing is waiting, just redraw
+            await _show_panel(bot, query.message, parts[2] if len(parts) > 2 else "main")
+        return
+
     if action == "tg":
         field = {
             "fsub": "force_sub_enabled",
@@ -367,7 +378,7 @@ async def settings_callback(bot, query):
             bot, query,
             prompt_text=FSUB_ADD_PROMPT, not_channel_text=FSUB_ADD_NOT_CHANNEL,
             not_admin_text=FSUB_ADD_NOT_ADMIN, ok_text=FSUB_ADD_OK, failed_text=FSUB_ADD_FAILED,
-            add_fn=add_fsub_channel, build_menu_fn=build_fsub_menu,
+            add_fn=add_fsub_channel, build_menu_fn=build_fsub_menu, back_to="fsub",
         )
         return
 
@@ -381,11 +392,13 @@ async def settings_callback(bot, query):
 
     if action == "idx_add":
         await query.answer()
+        # "cfg#idx_add#main" = pressed on the main panel, plain "cfg#idx_add" = on the Index panel
+        back_to = "main" if len(parts) > 2 and parts[2] == "main" else "index"
         await _run_channel_add(
             bot, query,
             prompt_text=INDEX_ADD_PROMPT, not_channel_text=INDEX_ADD_NOT_CHANNEL,
             not_admin_text=INDEX_ADD_NOT_ADMIN, ok_text=INDEX_ADD_OK, failed_text=INDEX_ADD_FAILED,
-            add_fn=add_index_channel, build_menu_fn=build_index_menu,
+            add_fn=add_index_channel, build_menu_fn=build_index_menu, back_to=back_to,
         )
         return
 
@@ -397,7 +410,7 @@ async def settings_callback(bot, query):
             not_admin_text=INDEX_ADD_NOT_ADMIN, ok_text=MOVIE_UPDATE_FETCH_ADDED,
             failed_text=INDEX_ADD_FAILED,
             add_fn=add_fetch_channel, build_menu_fn=build_movie_update_menu,
-            verify_fn=_verify_fetch_channel,
+            verify_fn=_verify_fetch_channel, back_to="movieupd",
         )
         return
 
@@ -464,18 +477,75 @@ async def _resolve_channel(bot, reply):
     return None, None
 
 
-async def _run_channel_add(bot, query, *, prompt_text, not_channel_text, not_admin_text,
-                            ok_text, failed_text, add_fn, build_menu_fn, verify_fn=None):
-    prompt = await query.message.edit_text(prompt_text)
+# ── "send me a value" prompts ─────────────────────────────────────────────────
+# While a prompt is open the admin sees one message with a Back button. Their
+# typed reply is read and then deleted, so the chat stays clean. Back (or any
+# /command, or 2 minutes of silence) stops the wait and redraws the panel.
+
+_PENDING: dict = {}          # (chat_id, user_id) -> True while a prompt is waiting
+
+
+def _back_markup(where: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(ASK_BACK_BTN, callback_data=f"cfg#cancel#{where}")]])
+
+
+async def _show_panel(bot, message, where: str, prefix: str = ""):
+    """Redraw the settings panel `where` (main | fsub | index | movieupd) in `message`."""
+    settings = await get_settings()
+    if where == "fsub":
+        text, markup = await build_fsub_menu(bot, settings)
+    elif where == "index":
+        text, markup = await build_index_menu(bot, settings)
+    elif where == "movieupd":
+        text, markup = await build_movie_update_menu(bot, settings)
+    else:
+        text, markup = SETTINGS_MAIN_TXT, build_main_menu(settings)
     try:
-        reply = await bot.listen(chat_id=query.message.chat.id, user_id=query.from_user.id, timeout=90)
-    except asyncio.TimeoutError:
-        settings = await get_settings()
-        text, markup = await build_menu_fn(bot, settings)
-        await prompt.edit_text(text, reply_markup=markup)
+        await message.edit_text((prefix + "\n\n" if prefix else "") + text, reply_markup=markup)
+    except RPCError:
+        pass
+
+
+async def _safe_delete(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def _wait_for_admin(bot, chat_id: int, user_id: int, timeout: float):
+    """-> (message, None) or (None, "timeout" | "cancel")."""
+    key = (chat_id, user_id)
+    _PENDING[key] = True
+    try:
+        return await bot.listen(chat_id=chat_id, user_id=user_id, timeout=timeout), None
+    except ListenerTimeout:
+        return None, "timeout"
+    except ListenerStopped:
+        return None, "cancel"
+    finally:
+        _PENDING.pop(key, None)
+
+
+async def _run_channel_add(bot, query, *, prompt_text, not_channel_text, not_admin_text,
+                            ok_text, failed_text, add_fn, build_menu_fn, verify_fn=None,
+                            back_to="main"):
+    prompt = await query.message.edit_text(prompt_text, reply_markup=_back_markup(back_to))
+    reply, outcome = await _wait_for_admin(bot, query.message.chat.id, query.from_user.id, 90)
+    if outcome == "cancel":
+        await _show_panel(bot, prompt, back_to)
+        return
+    if outcome == "timeout":
+        await _show_panel(bot, prompt, back_to, ASK_NUMBER_TIMEOUT)
+        return
+
+    if reply.text and reply.text.startswith("/"):      # a command = "never mind"
+        await _safe_delete(reply)
+        await _show_panel(bot, prompt, back_to)
         return
 
     chat, error = await _resolve_channel(bot, reply)
+    await _safe_delete(reply)                          # read it, then remove it
     settings = await get_settings()
 
     if error:
@@ -502,33 +572,56 @@ async def _run_channel_add(bot, query, *, prompt_text, not_channel_text, not_adm
     await prompt.edit_text(ok_text.format(title=html.escape(chat.title or str(chat.id))) + "\n\n" + text, reply_markup=markup)
 
 
+def _parse_ask_value(field: str, raw: str):
+    """Delay fields take seconds ("300") or a unit ("5min", "2hours", "1day");
+    the file limit takes a plain number. None = invalid."""
+    if raw.isdigit():
+        return int(raw)
+    if field in ("query_delay", "file_delay"):
+        return parse_duration(raw)
+    return None
+
+
 async def _run_ask_number(bot, query, field: str):
     prompts = {
         "query_delay": ASK_QUERY_DELAY_PROMPT,
         "file_delay": ASK_FILE_DELAY_PROMPT,
         "file_limit": ASK_FILE_LIMIT_PROMPT,
     }
-    prompt = await query.message.edit_text(prompts[field])
-    try:
-        reply = await bot.listen(chat_id=query.message.chat.id, user_id=query.from_user.id, timeout=60)
-        value = int(reply.text.strip())
-        if value < 0:
-            raise ValueError
-    except asyncio.TimeoutError:
-        settings = await get_settings()
-        await prompt.edit_text(ASK_NUMBER_TIMEOUT, reply_markup=build_main_menu(settings))
-        return
-    except (ValueError, AttributeError):
-        settings = await get_settings()
-        await prompt.edit_text(ASK_NUMBER_INVALID, reply_markup=build_main_menu(settings))
-        return
+    markup = _back_markup("main")
+    prompt = await query.message.edit_text(prompts[field], reply_markup=markup)
+
+    deadline = time.monotonic() + 120
+    value = None
+    while value is None:
+        reply, outcome = await _wait_for_admin(
+            bot, query.message.chat.id, query.from_user.id, max(deadline - time.monotonic(), 1),
+        )
+        if outcome == "cancel":
+            await _show_panel(bot, prompt, "main")
+            return
+        if outcome == "timeout":
+            await _show_panel(bot, prompt, "main", ASK_NUMBER_TIMEOUT)
+            return
+
+        raw = (reply.text or "").strip()
+        await _safe_delete(reply)                      # read it, then remove it
+        if raw.startswith("/"):                        # a command = "never mind"
+            await _show_panel(bot, prompt, "main")
+            return
+        value = _parse_ask_value(field, raw)
+        if value is None:                              # stay on the prompt, let them retry
+            try:
+                await prompt.edit_text(ASK_NUMBER_RETRY + prompts[field], reply_markup=markup)
+            except RPCError:
+                pass
 
     if field == "query_delay":
         settings = await update_settings({"query_autodelete_seconds": value})
-        text = QUERY_DELAY_SET_TXT.format(seconds=value)
+        text = QUERY_DELAY_SET_TXT.format(duration=format_duration(value))
     elif field == "file_delay":
         settings = await update_settings({"file_autodelete_seconds": value})
-        text = FILE_DELAY_SET_TXT.format(seconds=value)
+        text = FILE_DELAY_SET_TXT.format(duration=format_duration(value))
     else:
         settings = await update_settings({"file_limit_count": value})
         text = FILE_LIMIT_SET_TXT.format(count=value)

@@ -12,13 +12,27 @@ from pyrogram.errors import UserIsBlocked
 
 from config import ADMINS, REQUEST_CHANNEL
 from database.request_db import add_request
+from database.settings_db import get_settings
+from utils import format_duration
 from strings import (
-    REQUEST_SENT_TXT, REQUEST_RECEIVED_TXT, REQUEST_NOT_CONFIGURED_TXT,
+    REQUEST_SENT_TXT, REQUEST_RECEIVED_TXT, REQUEST_NOT_CONFIGURED_TXT, REQUEST_HELP_TXT,
+    QUERY_AUTODELETE_NOTE,
     ALREADY_AVAILABLE_TXT, NOT_RELEASED_TXT, CHECK_SPELLING_TXT, UPLOADED_TXT,
     NOT_AVAILABLE_TXT, YEAR_LANGUAGE_TXT, WRONG_SPELLING_TXT, CUSTOM_REPLY_TXT
 )
 
 logger = logging.getLogger(__name__)
+
+
+_bg_tasks: set = set()     # strong refs so background deletes aren't garbage-collected
+
+
+async def _delete_later(message, seconds: int):
+    await asyncio.sleep(seconds)
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 def _requested_name(msg) -> str:
@@ -584,12 +598,19 @@ async def manual_request_cmd(bot, message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text(
-            "📮 <b>How to use:</b>\n\n"
-            "<code>/request Movie Name</code>\n"
-            "<code>/req Movie Name</code>\n\n"
-            "Example: <code>/req Inception 2010</code>"
-        )
+        # Half-typed command: show the format, and clear it on the same timer as
+        # the search messages (/settings -> Query Auto-Delete) so chats stay clean.
+        settings = await get_settings()
+        text = REQUEST_HELP_TXT
+        autodelete = settings["query_autodelete_enabled"]
+        seconds = settings["query_autodelete_seconds"]
+        if autodelete:
+            text += QUERY_AUTODELETE_NOTE.format(duration=format_duration(seconds))
+        help_msg = await message.reply_text(text)
+        if autodelete:
+            task = asyncio.create_task(_delete_later(help_msg, seconds))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
         return
     
     query = args[1].strip()

@@ -31,7 +31,7 @@ from database.limit_db import get_today_count, increment_today
 from plugins.force_sub import missing_channels
 from fastdl.links import start_button_markup
 from shortlink import make_short_link
-from utils import temp
+from utils import temp, format_duration
 from strings import (
     FILE_NOT_FOUND_TXT, FILE_SEND_CAPTION, FILE_SEND_CAPTION_WITH_LIMIT,
     FSUB_REQUIRED_TXT, TRY_AGAIN_BTN,
@@ -119,7 +119,7 @@ async def _schedule_file_delete(bot, sent_message, seconds: int):
     try:
         notice = await bot.send_message(
             sent_message.chat.id,
-            FILE_AUTODELETE_NOTICE.format(seconds=seconds),
+            FILE_AUTODELETE_NOTICE.format(duration=format_duration(seconds)),
             reply_to_message_id=sent_message.id,
         )
     except RPCError:

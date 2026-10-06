@@ -41,6 +41,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("admin", "Admin commands panel"),
     BotCommand("settings", "Admin settings panel"),
     BotCommand("telegraph", "Get a link for a photo/video"),
+    BotCommand("aliases", "List search aliases"),
 ]
 
 

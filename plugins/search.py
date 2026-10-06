@@ -20,7 +20,7 @@ from database.settings_db import get_settings
 from database.trending_db import record_search, title_of
 from filterwords import apply_filter_words
 from linkcheck import has_link
-from poster import fetch_poster
+from poster import fetch_poster_for_results
 from spellcheck import fuzzy_correct, suggest_titles
 from utils import temp, human_size, format_duration
 from strings import (
@@ -445,18 +445,14 @@ async def _status_update(message, text: str, markup=None):
         return message
 
 
-async def _no_poster():
-    return None
-
-
 async def _deliver_results(message, resolved_query: str, results: list,
-                            original_query: str | None = None, poster=None,
-                            skip_poster: bool = False):
+                            original_query: str | None = None):
     """Send the poster (if found) + the results/filter message — the exact
     same flow whether Stage 1 found it directly or the user just clicked a
-    Stage-3 suggestion button."""
-    if poster is None and not skip_poster:
-        poster = await fetch_poster(resolved_query)
+    Stage-3 suggestion button. The poster always comes from the result
+    files' own names (most common title if they're mixed), never from the
+    typed query."""
+    poster = await fetch_poster_for_results(results)
 
     settings = await get_settings()
     mode = settings["result_mode"]
@@ -471,7 +467,7 @@ async def _deliver_results(message, resolved_query: str, results: list,
     if poster:
         poster_msg = await message.reply_photo(
             poster["url"],
-            caption=POSTER_CAPTION_TXT.format(query=html.escape(resolved_query)),
+            caption=POSTER_CAPTION_TXT.format(query=html.escape(poster.get("title") or resolved_query)),
             quote=True,
         )
         to_delete.append(poster_msg)
@@ -526,17 +522,15 @@ async def handle_search(bot, message):
         message.reply_text(STATUS_STAGE1_TXT.format(query=html.escape(query)), quote=True)
     )
     # A query that is only language and/or year (e.g. "Hindi 2024") has no
-    # title — so no poster lookup and no trending entry for it.
+    # title of its own — no trending entry for it (its poster still comes
+    # from the result files, like every other search).
     lang_year_only = is_language_year_query(query)
-    results, poster = await asyncio.gather(
-        search_files(query),
-        _no_poster() if lang_year_only else fetch_poster(query),
-    )
+    results = await search_files(query)
     status = await status_task
 
     if results:
         # Stage 1 already found it — the common, fast path.
-        await _deliver_results(message, query, results, poster=poster, skip_poster=lang_year_only)
+        await _deliver_results(message, query, results)
         if not lang_year_only:
             asyncio.create_task(record_search(title_of(results, query)))
         asyncio.create_task(_schedule_delete(status, 0))
@@ -551,10 +545,7 @@ async def handle_search(bot, message):
     hit = await fuzzy_correct(query)
     if hit:
         resolved_query, results = hit
-        # The original query's poster lookup was based on a misspelled
-        # title and likely came back empty — retry with the corrected one.
-        poster = poster or await fetch_poster(resolved_query)
-        await _deliver_results(message, resolved_query, results, original_query=query, poster=poster)
+        await _deliver_results(message, resolved_query, results, original_query=query)
         asyncio.create_task(record_search(title_of(results, resolved_query)))
         asyncio.create_task(_schedule_delete(status, 0))
         return

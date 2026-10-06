@@ -450,6 +450,7 @@ _JUNK_RE = re.compile(
     + r")\b.*",
     re.IGNORECASE,
 )
+_FIRST_WORD_RE = re.compile(r"^[\W_]*\w+")
 _TITLE_PUNCT_RE = re.compile(r"[._\-+\[\]()'\"~]+")
 _TITLE_SPACE_RE = re.compile(r"\s{2,}")
 
@@ -462,7 +463,15 @@ def clean_title(text: str) -> str:
     t = _HTML_TAG_RE.sub(" ", text)
     t = clean_display_text(t)
     t = _YEAR_PATTERN.sub(" ", t)
-    t = _JUNK_RE.sub(" ", t)
+    # A title can legitimately START with a language/tag word ("Hindi Medium",
+    # "English Vinglish", "Sub Zero"). Keep the first word untouched and only
+    # cut junk markers that come after it.
+    head_match = _FIRST_WORD_RE.match(t)
+    if head_match:
+        head, tail = t[:head_match.end()], t[head_match.end():]
+        t = head + _JUNK_RE.sub(" ", tail)
+    else:
+        t = _JUNK_RE.sub(" ", t)
     t = _TITLE_PUNCT_RE.sub(" ", t)
     return _TITLE_SPACE_RE.sub(" ", t).strip()
 
@@ -770,6 +779,12 @@ async def search_files(query: str) -> list:
     query = query.strip()
     if not query:
         return []
+
+    # A query made only of tags (language / year / resolution / quality) is a
+    # tag search, decided before any title cleaning so a language word at the
+    # start of a title can never be mistaken for it (or vice versa).
+    if parse_tag_only_query(query) is not None:
+        return await _search_by_tags(query)
 
     title, tags = parse_query(query)
     query_key = clean_title(title).lower()

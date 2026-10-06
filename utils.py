@@ -49,6 +49,20 @@ def readable_time(seconds: float) -> str:
     return " ".join(parts) or "0s"
 
 
+def format_duration(seconds) -> str:
+    """Seconds -> plain words:  60 -> "1 minute", 3600 -> "1 hour",
+    86400 -> "1 day", 5400 -> "1 hour 30 minutes", 45 -> "45 seconds"."""
+    seconds = max(0, int(seconds))
+    if seconds == 0:
+        return "0 seconds"
+    parts = []
+    for name, secs in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
+        val, seconds = divmod(seconds, secs)
+        if val:
+            parts.append(f"{val} {name}{'' if val == 1 else 's'}")
+    return " ".join(parts)
+
+
 class Throttle:
     """Only allow an action every `interval` seconds — used to keep progress
     message edits from hitting Telegram's rate limit during indexing."""

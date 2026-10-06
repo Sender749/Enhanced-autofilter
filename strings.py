@@ -59,8 +59,8 @@ FILE_SEND_CAPTION_WITH_LIMIT = "<code>{file_name}</code>\n\n📊 Free file {used
 FILE_NOT_FOUND_TXT = "❌ That file is no longer available."
 
 # ── Auto-delete ────────────────────────────────────────────────────────────────
-QUERY_AUTODELETE_NOTE = "\n\n⏳ <i>This message will self-destruct in {seconds}s.</i>"
-FILE_AUTODELETE_NOTICE = "🗑 This file will be deleted in <b>{seconds}</b> seconds to avoid copyright issues. Forward or save it now."
+QUERY_AUTODELETE_NOTE = "\n\n⏳ <i>This message will self-destruct in {duration}.</i>"
+FILE_AUTODELETE_NOTICE = "🗑 This file will be deleted in <b>{duration}</b> to avoid copyright issues. Forward or save it now."
 FILE_AUTODELETE_DONE = "🗑 File deleted."
 
 # ── Force-subscribe ──────────────────────────────────────────────────────────
@@ -133,12 +133,20 @@ INDEX_REMOVED_TXT = "✅ Removed from auto-indexing."
 
 ASK_NUMBER_TIMEOUT = "⌛ Timed out — no changes made."
 ASK_NUMBER_INVALID = "That's not a valid number — no changes made."
+ASK_NUMBER_RETRY = "❌ <b>That's not a valid value.</b> Try again, or tap Back.\n\n"
+ASK_BACK_BTN = "⬅️ Back"
 
-ASK_QUERY_DELAY_PROMPT = "Send how many seconds a search-result message should stay before I delete it."
-QUERY_DELAY_SET_TXT = "✅ Search results will now self-delete after <code>{seconds}</code> seconds."
+ASK_QUERY_DELAY_PROMPT = (
+    "Send how long a search-result message should stay before I delete it.\n\n"
+    "Seconds (e.g. <code>300</code>) or with a unit (e.g. <code>5min</code>, <code>2hours</code>, <code>1day</code>)."
+)
+QUERY_DELAY_SET_TXT = "✅ Search results will now self-delete after <b>{duration}</b>."
 
-ASK_FILE_DELAY_PROMPT = "Send how many seconds a delivered file should stay before I delete it."
-FILE_DELAY_SET_TXT = "✅ Delivered files will now self-delete after <code>{seconds}</code> seconds."
+ASK_FILE_DELAY_PROMPT = (
+    "Send how long a delivered file should stay before I delete it.\n\n"
+    "Seconds (e.g. <code>600</code>) or with a unit (e.g. <code>10min</code>, <code>2hours</code>, <code>1day</code>)."
+)
+FILE_DELAY_SET_TXT = "✅ Delivered files will now self-delete after <b>{duration}</b>."
 
 ASK_FILE_LIMIT_PROMPT = "Send how many free files a non-premium user can get per day (e.g. <code>2</code>)."
 FILE_LIMIT_SET_TXT = "✅ Free daily file limit set to <code>{count}</code>."
@@ -329,13 +337,15 @@ TELEGRAPH_NOT_MEDIA_TXT = "❌ That's not a photo or video. Send /telegraph agai
 TELEGRAPH_TOO_BIG_TXT = "❌ File too big: <b>{size}</b> (max <b>{limit}</b> for the current provider)."
 TELEGRAPH_DOWNLOADING_TXT = "⬇️ Downloading…"
 TELEGRAPH_UPLOADING_TXT = "⬆️ Uploading…"
-TELEGRAPH_FAILED_TXT = "❌ Upload failed on every provider.\n<code>{error}</code>"
+TELEGRAPH_FAILED_TXT = "❌ <b>Upload failed on every provider.</b>\n\n<code>{error}</code>"
+TELEGRAPH_CANCEL_BTN = "❌ Cancel"
+TELEGRAPH_TEMP_NOTE = "\n\n⏳ <i>This host keeps files only <b>{keep}</b> — for config.py use the file_id below, it never expires.</i>"
 TELEGRAPH_DONE_TXT = (
     "✅ <b>Link ready</b>\n\n"
     "🔗 <code>{url}</code>\n"
     "🌐 Host: <code>{host}</code>\n\n"
     "🆔 <b>file_id</b> (use for WELCOME_VIDEO / PREMIUM_PHOTO):\n<code>{file_id}</code>\n\n"
-    "Paste the link or file_id into <code>config.py</code>."
+    "Paste the link or file_id into <code>config.py</code>.{note}"
 )
 
 # ── Premium page (shown by the "premium" button) ──────────────────────────────
@@ -367,3 +377,11 @@ PREMIUM_TEXT = """<b><i><blockquote>ᴀᴠᴀɪʟᴀʙʟᴇ ᴘʟᴀɴs  ♻️<
 💢 ᴍᴜsᴛ sᴇɴᴅ sᴄʀᴇᴇɴsʜᴏᴛ ᴀꜰᴛᴇʀ ᴘᴀʏᴍᴇɴᴛ
 
 ‼️ ᴀꜰᴛᴇʀ sᴇɴᴅɪɴɢ ᴀ sᴄʀᴇᴇɴsʜᴏᴛ ᴘʟᴇᴀsᴇ ɢɪᴠᴇ ᴍᴇ sᴏᴍᴇ ᴛɪᴍᴇ ᴛᴏ ᴀᴅᴅ ʏᴏᴜ ɪɴ ᴛʜᴇ ᴘʀᴇᴍɪᴜᴍ ᴠᴇʀsɪᴏɴ.</i></b>"""
+
+# ── /req format help (auto-deleted with the other bot messages) ───────────────
+REQUEST_HELP_TXT = (
+    "📮 <b>How to use:</b>\n\n"
+    "<code>/request Movie Name</code>\n"
+    "<code>/req Movie Name</code>\n\n"
+    "Example: <code>/req Inception 2010</code>"
+)

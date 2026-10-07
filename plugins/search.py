@@ -14,6 +14,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK
 from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
+    related_titles,
 )
 from database.alias_db import alias_key, create_miss, set_miss_message
 from database.settings_db import get_settings
@@ -28,7 +29,7 @@ from strings import (
     SEARCH_EXPIRED_TXT, QUERY_AUTODELETE_NOTE, FILTER_LABELS, FILTER_MENU_TXT,
     FILTER_CLEAR_BTN, HOME_BTN, NO_MATCH_TXT,
     STATUS_STAGE1_TXT, STATUS_STAGE2_TXT, STATUS_STAGE3_TXT,
-    SUGGESTIONS_HEADER_TXT, SUGGESTION_NOT_FOUND_TXT,
+    SUGGESTIONS_HEADER_TXT, SUGGESTION_NOT_FOUND_TXT, RELATED_HEADER_TXT,
     REQUEST_BTN_TXT, REQUEST_NOT_CONFIGURED_TXT, REQUEST_SENT_TXT,
     MAINTENANCE_TXT, EMPTY_QUERY_TXT,
     PM_SEARCH_OFF_TXT, PM_SEARCH_OFF_BTN,
@@ -556,8 +557,16 @@ async def handle_search(bot, message):
     # candidate titles to show as buttons — nothing is searched in your
     # database, and nothing is shown as a result, until the user actually
     # taps one.
-    status = await _status_update(status, STATUS_STAGE3_TXT)
-    suggestions = await suggest_titles(query)
+    # First look for titles in OUR database that start with the query
+    # ("pushpa" -> "Pushpa The Rise", "Pushpa 2 The Rule"): they are real,
+    # they have files, and it needs no outside API. Only when there are none
+    # does the bot ask TMDB/OMDb/AI for suggestions.
+    related = await related_titles(query)
+    if related:
+        suggestions = related
+    else:
+        status = await _status_update(status, STATUS_STAGE3_TXT)
+        suggestions = await suggest_titles(query)
     user_id = message.from_user.id if message.from_user else None
 
     rows = []
@@ -571,7 +580,7 @@ async def handle_search(bot, message):
     markup = InlineKeyboardMarkup(rows)
 
     text = (
-        SUGGESTIONS_HEADER_TXT.format(query=html.escape(query)) if suggestions
+        (RELATED_HEADER_TXT if related else SUGGESTIONS_HEADER_TXT).format(query=html.escape(query)) if suggestions
         else NOT_FOUND_TXT.format(query=html.escape(query))
     )
     autodelete = settings["query_autodelete_enabled"]

@@ -496,10 +496,10 @@ def clean_title(text: str) -> str:
 # comparing text. What it ignores:
 #   * spacing           spider man = spiderman = spider-man
 #   * every symbol      : - – — , ! ? & / ' " . _ ( ) [ ] ...
-#   * the words in _KEY_STOPWORDS (the / a / an)
+#   * words listed in _KEY_STOPWORDS (empty on purpose: "the/a/an" count)
 # What it never ignores: digits and every other word — "Weak Hero Class 2"
 # never matches "Weak Hero Class 1", and "You" never matches "You Love Me".
-_KEY_STOPWORDS = frozenset({"the", "a", "an"})
+_KEY_STOPWORDS = frozenset()  # articles (the/a/an) are NOT dropped: "The Flash" and "Flash" are different titles
 _KEY_WORD_RE = re.compile(r"[^\W_]+")
 _KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")
 _KEY_POSSESSIVE_RE = re.compile(r"['\u2019\u2018`\u00b4]s\b", re.IGNORECASE)

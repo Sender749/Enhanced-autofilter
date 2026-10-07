@@ -102,6 +102,7 @@ async def save_file(media, channel_id: int | None = None) -> str:
         "caption": caption,
         "words": words,
         "tkeys": tkeys,
+        "tkv": KEY_VERSION,
         "file_type": getattr(media, "file_type", "document"),
         "mime_type": getattr(media, "mime_type", "") or "",
         "channel_id": channel_id,
@@ -118,7 +119,7 @@ async def save_file(media, channel_id: int | None = None) -> str:
         if existing is not None and existing.get("caption", "") != caption:
             await files.update_one(
                 {"file_unique_id": file_unique_id},
-                {"$set": {"caption": caption, "file_name": file_name, "words": words, "tkeys": tkeys}},
+                {"$set": {"caption": caption, "file_name": file_name, "words": words, "tkeys": tkeys, "tkv": KEY_VERSION}},
             )
             return "updated"
         return "duplicate"
@@ -150,7 +151,8 @@ async def backfill_word_index(batch_size: int = 500) -> int:
     updated = 0
     batch = []
     cursor = files.find(
-        {"$or": [{"words": {"$exists": False}}, {"tkeys": {"$exists": False}}]},
+        {"$or": [{"words": {"$exists": False}}, {"tkeys": {"$exists": False}},
+              {"tkv": {"$ne": KEY_VERSION}}]},
         {"file_name": 1, "caption": 1},
     )
     async for doc in cursor:
@@ -158,7 +160,7 @@ async def backfill_word_index(batch_size: int = 500) -> int:
         caption = doc.get("caption", "") or ""
         words = sorted(set(_tokenize(f"{file_name} {caption}")))
         tkeys = doc_title_keys(file_name, caption)
-        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"words": words, "tkeys": tkeys}}))
+        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"words": words, "tkeys": tkeys, "tkv": KEY_VERSION}}))
         if len(batch) >= batch_size:
             await files.bulk_write(batch, ordered=False)
             updated += len(batch)
@@ -466,6 +468,17 @@ _TITLE_PUNCT_RE = re.compile(r"[._\-+\[\]()'\"~]+")
 _TITLE_SPACE_RE = re.compile(r"\s{2,}")
 
 
+# Characters that are invisible or blank but still count as "word" characters
+# (Hangul filler U+3164 is the common one in real captions: 1,300+ captions
+# start with it) — they must never become the "first word" of a title.
+_INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060\ufeff\u3164\u115f\u1160\u2800\u00a0]")
+# "[TurabSSH] Beyblade S01E19" — a release-group tag in front of the title.
+_LEADING_TAG_RE = re.compile(r"^\s*\[[^\]\n]{1,40}\]\s*")
+# "720p • Jawan 2023" — a quality tag in front of the title.
+_LEADING_RES_RE = re.compile(r"^[\W_]*(?:\d{3,4}p|4k|uhd)\b[\W_]*", re.IGNORECASE)
+_HAS_LETTER_RE = re.compile(r"[^\W\d_]{2,}")  # a real word (2+ letters), not the "p" of 720p
+
+
 def clean_title(text: str) -> str:
     # Captions are stored via Telegram's HTML rendering (message.caption.html),
     # so a bold/italic-formatted title arrives as literal "<b>Title</b>" —
@@ -473,10 +486,43 @@ def clean_title(text: str) -> str:
     # unformatted query, which used to make Stage 1 miss almost everything.
     t = _HTML_TAG_RE.sub(" ", text)
     t = clean_display_text(t)
-    t = _YEAR_PATTERN.sub(" ", t)
+    # Underscore-separated file names ("Avengers_Infinity_War_2018_BluRay…"):
+    # "_" counts as a word character, so without this no year / quality tag in
+    # them is ever recognised and the whole file name becomes the "title".
+    t = _INVISIBLE_RE.sub(" ", t.replace("_", " ")).strip()
+
+    # Junk IN FRONT of the title: a [Group] tag, then a leading 720p/1080p.
+    stripped = _LEADING_TAG_RE.sub("", t, count=1)
+    if _HAS_LETTER_RE.search(stripped):
+        t = stripped
+    for _ in range(2):
+        stripped = _LEADING_RES_RE.sub("", t, count=1)
+        if stripped == t or not _HAS_LETTER_RE.search(stripped):
+            break
+        t = stripped
+
     # A title can legitimately START with a language/tag word ("Hindi Medium",
     # "English Vinglish", "Sub Zero"). Keep the first word untouched and only
     # cut junk markers that come after it.
+    head_match = _FIRST_WORD_RE.match(t)
+    split = head_match.end() if head_match else 0
+    junk = _JUNK_RE.search(t, split)
+    stop = junk.start() if junk else len(t)
+
+    # The release year is the most reliable end-of-title marker: in
+    # "Jawan (2023) Extended Cut Bollywood Hindi ..." everything after it is
+    # description, not title. Use the LAST year before the first quality /
+    # language tag (so "Blade Runner 2049 (2017)" keeps "2049"), and only if
+    # a real word stands in front of it (so "1917" and "2012" stay titles).
+    cut = None
+    for ym in _YEAR_PATTERN.finditer(t, 0, stop):
+        if _HAS_LETTER_RE.search(t[:ym.start()]):
+            cut = ym.start()
+    if cut is not None:
+        t = t[:cut]
+    else:
+        t = _YEAR_PATTERN.sub(" ", t)
+
     head_match = _FIRST_WORD_RE.match(t)
     if head_match:
         head, tail = t[:head_match.end()], t[head_match.end():]
@@ -484,7 +530,7 @@ def clean_title(text: str) -> str:
     else:
         t = _JUNK_RE.sub(" ", t)
     t = _TITLE_PUNCT_RE.sub(" ", t)
-    return _TITLE_SPACE_RE.sub(" ", t).strip()
+    return _TITLE_SPACE_RE.sub(" ", t).strip(" \t•|:,;/\\")
 
 
 # ── Matching key ────────────────────────────────────────────────────────────
@@ -499,6 +545,10 @@ def clean_title(text: str) -> str:
 #   * words listed in _KEY_STOPWORDS (empty on purpose: "the/a/an" count)
 # What it never ignores: digits and every other word — "Weak Hero Class 2"
 # never matches "Weak Hero Class 1", and "You" never matches "You Love Me".
+# Bump this whenever the rules that build a title key change (clean_title /
+# title_key). Files stored with an older number are re-keyed automatically by
+# the startup backfill, so a rule change never leaves old files behind.
+KEY_VERSION = 2
 _KEY_STOPWORDS = frozenset()  # articles (the/a/an) are NOT dropped: "The Flash" and "Flash" are different titles
 _KEY_WORD_RE = re.compile(r"[^\W_]+")
 _KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")
@@ -819,6 +869,56 @@ async def _search_by_tags(query: str) -> list:
 
     results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
     return results[:_MAX_FETCH]
+
+
+async def related_titles(query: str, limit: int = 8) -> list:
+    """
+    Titles in the database that START WITH the query — used only when there is
+    no exact match, so "pushpa" can offer "Pushpa The Rise" and "dune" can
+    offer "Dune Part Two". Returns clean display titles, most files first.
+
+    Matching is on whole words ("jawan" never offers "Jawani ..."), ignores
+    spacing/symbols like the normal search ("spiderman" offers "Spider Man No
+    Way Home"), and only returns titles that are LONGER than the query — an
+    equal title would already have been found by the normal search.
+    """
+    title = parse_query(query)[0]
+    qkeys = title_key_variants(title)
+    if not qkeys or min(len(k) for k in qkeys) < 2:
+        return []
+
+    # tkeys is indexed, and an anchored prefix regex can use that index.
+    cond = [{"tkeys": {"$regex": "^" + re.escape(k)}} for k in qkeys]
+    cursor = files.find({"$or": cond}, {"file_name": 1, "caption": 1}).limit(_CANDIDATE_FETCH)
+    docs = await cursor.to_list(length=_CANDIDATE_FETCH)
+
+    longest = max(len(k) for k in qkeys)
+    groups: dict = {}  # normalised title -> {"count": n, "shown": {display: n}}
+    for doc in docs:
+        seen = set()
+        for src in {display_name(doc), doc.get("file_name", "") or ""}:
+            shown = clean_title(src)
+            tokens = _KEY_WORD_RE.findall(_KEY_APOSTROPHE_RE.sub("", shown).lower())
+            acc = ""
+            for i, tok in enumerate(tokens):
+                acc += tok
+                if acc in qkeys:
+                    if i + 1 < len(tokens):  # strictly longer than the query
+                        norm = " ".join(tokens)
+                        if norm not in seen:
+                            seen.add(norm)
+                            g = groups.setdefault(norm, {"count": 0, "shown": {}})
+                            g["count"] += 1
+                            g["shown"][shown] = g["shown"].get(shown, 0) + 1
+                    break
+                if len(acc) >= longest:
+                    break
+
+    ranked = sorted(groups.items(), key=lambda kv: (-kv[1]["count"], len(kv[0])))
+    out = []
+    for _norm, g in ranked[:limit]:
+        out.append(max(g["shown"].items(), key=lambda kv: kv[1])[0])
+    return out
 
 
 async def search_files(query: str, use_alias: bool = True) -> list:

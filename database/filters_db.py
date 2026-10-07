@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -22,6 +23,7 @@ async def ensure_indexes():
     # plain multikey index Mongo builds automatically for an array field,
     # giving indexed, exact, stopword-free word lookups.
     await files.create_index([("words", ASCENDING)], name="words_idx")
+    await files.create_index([("tkeys", ASCENDING)], name="tkeys_idx")
     await files.create_index([("file_unique_id", ASCENDING)], unique=True, name="uniq_file_idx")
     await files.create_index([("channel_id", ASCENDING)], name="channel_idx")
     logger.info("Database indexes ready.")
@@ -90,6 +92,7 @@ async def save_file(media, channel_id: int | None = None) -> str:
 
     caption = getattr(media, "caption", "") or ""
     words = sorted(set(_tokenize(f"{file_name} {caption}")))
+    tkeys = doc_title_keys(file_name, caption)
 
     doc = {
         "file_id": media.file_id,
@@ -98,6 +101,7 @@ async def save_file(media, channel_id: int | None = None) -> str:
         "file_size": getattr(media, "file_size", 0) or 0,
         "caption": caption,
         "words": words,
+        "tkeys": tkeys,
         "file_type": getattr(media, "file_type", "document"),
         "mime_type": getattr(media, "mime_type", "") or "",
         "channel_id": channel_id,
@@ -114,7 +118,7 @@ async def save_file(media, channel_id: int | None = None) -> str:
         if existing is not None and existing.get("caption", "") != caption:
             await files.update_one(
                 {"file_unique_id": file_unique_id},
-                {"$set": {"caption": caption, "file_name": file_name, "words": words}},
+                {"$set": {"caption": caption, "file_name": file_name, "words": words, "tkeys": tkeys}},
             )
             return "updated"
         return "duplicate"
@@ -133,10 +137,12 @@ async def count_by_channel(channel_id: int) -> int:
 
 async def backfill_word_index(batch_size: int = 500) -> int:
     """
-    One-time migration for files indexed before the `words` field existed.
+    Migration for files indexed before the `words` / `tkeys` fields existed
+    (tkeys = the spacing/symbol-proof title keys Stage 1 matches on).
     Safe to run repeatedly (idempotent) and safe to run while the bot is
     live — updates stream in small batches so it never holds a large chunk
-    of the collection in memory or blocks the DB for long.
+    of the collection in memory or blocks the DB for long. The bot also runs
+    this once in the background at startup.
     Returns the number of documents updated.
     """
     from pymongo import UpdateOne
@@ -144,15 +150,20 @@ async def backfill_word_index(batch_size: int = 500) -> int:
     updated = 0
     batch = []
     cursor = files.find(
-        {"words": {"$exists": False}}, {"file_name": 1, "caption": 1},
+        {"$or": [{"words": {"$exists": False}}, {"tkeys": {"$exists": False}}]},
+        {"file_name": 1, "caption": 1},
     )
     async for doc in cursor:
-        words = sorted(set(_tokenize(f"{doc.get('file_name', '')} {doc.get('caption', '') or ''}")))
-        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"words": words}}))
+        file_name = doc.get("file_name", "") or ""
+        caption = doc.get("caption", "") or ""
+        words = sorted(set(_tokenize(f"{file_name} {caption}")))
+        tkeys = doc_title_keys(file_name, caption)
+        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"words": words, "tkeys": tkeys}}))
         if len(batch) >= batch_size:
             await files.bulk_write(batch, ordered=False)
             updated += len(batch)
             batch = []
+            await asyncio.sleep(0.05)  # let live searches breathe
     if batch:
         await files.bulk_write(batch, ordered=False)
         updated += len(batch)
@@ -476,6 +487,58 @@ def clean_title(text: str) -> str:
     return _TITLE_SPACE_RE.sub(" ", t).strip()
 
 
+# ── Matching key ────────────────────────────────────────────────────────────
+# One normalised form of a title that is identical for every harmless way of
+# writing it, so "Spider-Man", "Spiderman" and "Spider Man" — or "The Vvaan:
+# Force of the Forrest" and "The Vvaan Force of Forrest" — all give the SAME
+# key. Built the same way for stored files (save_file) and typed queries
+# (search_files), so Stage 1 can match on one indexed equality instead of
+# comparing text. What it ignores:
+#   * spacing           spider man = spiderman = spider-man
+#   * every symbol      : - – — , ! ? & / ' " . _ ( ) [ ] ...
+#   * the words in _KEY_STOPWORDS (the / a / an)
+# What it never ignores: digits and every other word — "Weak Hero Class 2"
+# never matches "Weak Hero Class 1", and "You" never matches "You Love Me".
+_KEY_STOPWORDS = frozenset({"the", "a", "an"})
+_KEY_WORD_RE = re.compile(r"[^\W_]+")
+_KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")
+_KEY_POSSESSIVE_RE = re.compile(r"['\u2019\u2018`\u00b4]s\b", re.IGNORECASE)
+
+
+def _key_of(text: str) -> str:
+    t = clean_title(text).lower()
+    return "".join(w for w in _KEY_WORD_RE.findall(t) if w not in _KEY_STOPWORDS)
+
+
+def title_key_variants(text: str) -> list:
+    """The key(s) a title can be found by. Usually one. A title with a
+    possessive ("Mr. Bean's Holiday", "Schindler's List") gets two, because
+    people type it both ways: "Beans" (apostrophe just removed) and "Bean"
+    (the 's dropped)."""
+    if not text:
+        return []
+    base = text.replace("&", " and ")
+    keys = [_key_of(_KEY_APOSTROPHE_RE.sub("", base))]
+    if _KEY_POSSESSIVE_RE.search(base):
+        keys.append(_key_of(_KEY_APOSTROPHE_RE.sub("", _KEY_POSSESSIVE_RE.sub("", base))))
+    return [k for k in dict.fromkeys(keys) if k]
+
+
+def title_key(text: str) -> str:
+    variants = title_key_variants(text)
+    return variants[0] if variants else ""
+
+
+def doc_title_keys(file_name: str, caption: str) -> list:
+    """Every title key a stored file can be found by: from its caption (whole,
+    and its first line when the caption has several) and from its file name."""
+    caption = (caption or "").strip()
+    sources = [caption, file_name or ""]
+    if "\n" in caption:
+        sources.insert(1, caption.split("\n", 1)[0])
+    return sorted({k for src in sources for k in title_key_variants(src)})
+
+
 def extract_meta(results: list) -> dict:
     """One pass over the full (unfiltered) result set. Returns the distinct
     filter values available, so filter buttons never offer an empty choice."""
@@ -793,21 +856,33 @@ async def search_files(query: str, use_alias: bool = True) -> list:
         # resolution, quality), search by those instead of returning nothing.
         return await _search_by_tags(query)
 
+    key_source = title  # raw title text (keeps apostrophes for the key variants)
     if use_alias:
         # Admin-approved alias ("hindi madium" -> "hindi medium"). Only the
         # title is swapped; tags from the query are still applied below.
         # Imported here because alias_db itself imports this module.
         from database.alias_db import get_alias
-        query_key = await get_alias(query_key) or query_key
+        aliased = await get_alias(query_key)
+        if aliased:
+            query_key = key_source = aliased
 
-    words = _tokenize(query_key)
-    if not words:
-        return []
+    # Primary path: one indexed lookup on the spacing/symbol-proof title key
+    # ("spiderman" = "spider man" = "Spider-Man", "force of the forrest" =
+    # "force of forrest"). Files not yet migrated to tkeys fall through to the
+    # original word-index + exact clean-title path below.
+    results = []
+    qkeys = title_key_variants(key_source)
+    if qkeys:
+        cursor = files.find({"tkeys": {"$in": qkeys}}, _RESULT_FIELDS).limit(_CANDIDATE_FETCH)
+        results = await cursor.to_list(length=_CANDIDATE_FETCH)
 
-    cursor = files.find({"words": {"$all": words}}, _RESULT_FIELDS).limit(_CANDIDATE_FETCH)
-    candidates = await cursor.to_list(length=_CANDIDATE_FETCH)
-
-    results = [doc for doc in candidates if clean_title(display_name(doc)).lower() == query_key]
+    if not results:
+        words = _tokenize(query_key)
+        if not words:
+            return []
+        cursor = files.find({"words": {"$all": words}}, _RESULT_FIELDS).limit(_CANDIDATE_FETCH)
+        candidates = await cursor.to_list(length=_CANDIDATE_FETCH)
+        results = [doc for doc in candidates if clean_title(display_name(doc)).lower() == query_key]
 
     active_tags = {k: v for k, v in tags.items() if v is not None}
     if active_tags:

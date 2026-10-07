@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiohttp import web
@@ -10,7 +11,7 @@ from config import (
     BIN_CHANNEL, STREAM_SECRET, STREAM_BASE_URL, ORACLE_STREAM_URL,
     HELPER_BOT_TOKENS, FASTDL_SERVER_ENABLED, FASTDL_ENABLED,
 )
-from database.filters_db import ensure_indexes
+from database.filters_db import ensure_indexes, backfill_word_index
 from database.premium_db import ensure_indexes as ensure_premium_indexes
 from database.verify_db import ensure_indexes as ensure_verify_indexes
 from database.request_db import ensure_indexes as ensure_request_indexes
@@ -55,8 +56,19 @@ class Bot(Client):
             plugins={"root": "plugins"},
         )
 
+    async def _backfill_search_keys(self):
+        try:
+            updated = await backfill_word_index()
+            if updated:
+                logger.info("Search-key backfill finished: %s files updated.", updated)
+        except Exception:
+            logger.exception("Search-key backfill failed (search still works; retry from /settings)")
+
     async def start(self):
         await ensure_indexes()
+        # Fill in the search keys (words / tkeys) for files indexed before they
+        # existed. Background + idempotent: a no-op once everything is migrated.
+        asyncio.create_task(self._backfill_search_keys())
         await ensure_premium_indexes()
         await ensure_verify_indexes()
         await ensure_request_indexes()

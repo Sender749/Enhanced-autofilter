@@ -133,22 +133,27 @@ def _sequel_number_preserved(original: str, candidate: str) -> bool:
     return _trailing_number(candidate) == original_num
 
 
+_SYMBOLS_RE = re.compile(r"[^\w\s]+")
+
+
 def _best_fuzzy_match(query: str, cache: list):
     """Pure CPU work — called via asyncio.to_thread so it never blocks the
     event loop while other users' searches are being served."""
-    q_clean = clean_title(query).lower()
+    # Symbols (: , ! ? & / – — ...) are word separators here, never part of a
+    # word — "vvaan:" must compare as "vvaan".
+    q_clean = _SYMBOLS_RE.sub(" ", clean_title(query).lower())
     q_words = q_clean.split()
     if not q_words:
         return None
-    q_collapsed = q_clean.replace(" ", "")
+    q_collapsed = "".join(q_words)
 
     best_score, best_title = 0.0, None
     for key, original in cache:
         if not _sequel_number_preserved(query, key):
             continue
-        if key.replace(" ", "") == q_collapsed:
+        cand_words = _SYMBOLS_RE.sub(" ", key).split()
+        if "".join(cand_words) == q_collapsed:
             return original  # same letters, just spacing/punctuation differs
-        cand_words = key.split()
         if not _word_count_ok(q_words, cand_words):
             continue
         score = _per_word_score(q_words, cand_words)

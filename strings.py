@@ -36,6 +36,7 @@ STATUS_STAGE3_TXT = "🤖 Asking AI..."
 
 # ── Stage 3 suggestion buttons (shown when nothing auto-resolves) ──────────
 SUGGESTIONS_HEADER_TXT = "🤔 Couldn't find an exact match for <b>{query}</b>. Did you mean:"
+RELATED_HEADER_TXT = "🔎 No exact match for <b>{query}</b>, but these related titles are in the database:"
 SUGGESTION_NOT_FOUND_TXT = "❌ <b>{title}</b> isn't in the database yet."
 
 SEARCH_EXPIRED_TXT = "⏳ This search has expired. Please search again."

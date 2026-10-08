@@ -8,7 +8,7 @@ import logging
 import re
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserIsBlocked
+from pyrogram.errors import UserIsBlocked, RPCError
 
 from config import ADMINS, REQUEST_CHANNEL
 from database.request_db import add_request
@@ -18,7 +18,7 @@ from strings import (
     REQUEST_SENT_TXT, REQUEST_RECEIVED_TXT, REQUEST_NOT_CONFIGURED_TXT, REQUEST_HELP_TXT,
     QUERY_AUTODELETE_NOTE,
     ALREADY_AVAILABLE_TXT, NOT_RELEASED_TXT, CHECK_SPELLING_TXT, UPLOADED_TXT,
-    NOT_AVAILABLE_TXT, YEAR_LANGUAGE_TXT, WRONG_SPELLING_TXT, CUSTOM_REPLY_TXT
+    NOT_AVAILABLE_TXT, YEAR_LANGUAGE_TXT, CUSTOM_REPLY_TXT
 )
 
 logger = logging.getLogger(__name__)
@@ -337,24 +337,99 @@ async def year_callback(bot, query):
         await query.answer("⚠️ Admin only!", show_alert=True)
 
 
+# ── Prompt helpers (admin is asked to type something in the request channel) ──
+_WAIT_LIMIT = 200   # cap on unanswered prompts kept in memory
+
+# Messages sent to the requester after "Uploaded / Available, Wrong Spelling"
+UPLOADED_SPELLING_TXT = (
+    "📌 Requested – <code>{requested_name}</code>\n\n"
+    "✅ Your requested file is uploaded, please send correct spelling - "
+    "<code>{correct_spelling}</code>"
+)
+AVAILABLE_SPELLING_TXT = (
+    "📌 Requested – <code>{requested_name}</code>\n\n"
+    "🫤 Your requested file is already uploaded, please send correct spelling - "
+    "<code>{correct_spelling}</code>"
+)
+
+
+async def _is_channel_admin(bot, chat_id, user_id) -> bool:
+    try:
+        st = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    return st.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+
+
+async def _temp_notice(bot, chat_id, text: str, seconds: int = 10):
+    """Short-lived message in the request channel (cleans itself up)."""
+    try:
+        note = await bot.send_message(chat_id, text)
+    except Exception:
+        return
+    task = asyncio.create_task(_delete_later(note, seconds))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _open_prompt(bot, store: dict, request_msg, text: str, cancel_data: str, data: dict):
+    """Post a 'send me X' prompt under the request message and start waiting for
+    the admin's reply. Any older prompt for the same request is removed first."""
+    chat_id = request_msg.chat.id
+    for wait in (_CUSTOM_REPLY_WAIT, _WRONG_SPELL_WAIT):
+        for pid, old in list(wait.items()):
+            if old["request_msg"].id == request_msg.id:
+                wait.pop(pid, None)
+                try:
+                    await bot.delete_messages(chat_id, pid)
+                except Exception:
+                    pass
+
+    prompt = await bot.send_message(
+        chat_id, text,
+        reply_to_message_id=request_msg.id,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=cancel_data)]])
+    )
+    store[prompt.id] = {**data, "request_msg": request_msg, "prompt_id": prompt.id}
+    while len(store) > _WAIT_LIMIT:
+        store.pop(next(iter(store)))
+    return prompt
+
+
 @Client.on_callback_query(filters.regex(r"^spl_wrong"))
 async def spl_wrong_callback(bot, query):
-    """Handle 'Uploaded, Wrong Spelling' - prompt admin for correct spelling."""
+    """'Uploaded, Wrong Spelling' - first ask the admin: Uploaded or Available?"""
     _, user_id, msg_id = query.data.split("#")
-    chnl_id = query.message.chat.id
-    st = await bot.get_chat_member(chnl_id, query.from_user.id)
-    if st.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+    if not await _is_channel_admin(bot, query.message.chat.id, query.from_user.id):
         return await query.answer("⚠️ Admin only!", show_alert=True)
-    
-    prompt = await bot.send_message(
-        chnl_id, "✏️ <b>Send correct spelling</b>",
-        reply_to_message_id=query.message.id,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_wrong#{query.message.id}")]])
+
+    buttons = [
+        [InlineKeyboardButton("✅ Uploaded", callback_data=f"splw_up#{user_id}#{msg_id}"),
+         InlineKeyboardButton("🫤 Available", callback_data=f"splw_av#{user_id}#{msg_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"show_options#{user_id}#{msg_id}")]
+    ]
+    try:
+        await query.message.edit_reply_markup(InlineKeyboardMarkup(buttons))
+    except RPCError:
+        pass
+    await query.answer("Uploaded or Available?")
+
+
+@Client.on_callback_query(filters.regex(r"^splw_(up|av)#"))
+async def spl_wrong_choice_callback(bot, query):
+    """Admin picked Uploaded / Available - now ask for the correct spelling."""
+    code, user_id, msg_id = query.data.split("#")
+    kind = "uploaded" if code == "splw_up" else "available"
+    if not await _is_channel_admin(bot, query.message.chat.id, query.from_user.id):
+        return await query.answer("⚠️ Admin only!", show_alert=True)
+
+    label = "✅ <b>Uploaded</b>" if kind == "uploaded" else "🫤 <b>Available</b>"
+    await _open_prompt(
+        bot, _WRONG_SPELL_WAIT, query.message,
+        f"{label}\n✏️ <b>Reply to this message with the correct spelling</b>",
+        f"cancel_wrong#{query.message.id}",
+        {"user_id": int(user_id), "msg_id": int(msg_id), "kind": kind},
     )
-    _WRONG_SPELL_WAIT[prompt.id] = {
-        "user_id": int(user_id), "msg_id": int(msg_id),
-        "request_msg": query.message, "prompt_id": prompt.id
-    }
     await query.answer()
 
 
@@ -363,11 +438,13 @@ async def cancel_wrong_callback(bot, query):
     """Cancel wrong spelling prompt."""
     _, req_msg_id = query.data.split("#")
     req_msg_id = int(req_msg_id)
+    if not await _is_channel_admin(bot, query.message.chat.id, query.from_user.id):
+        return await query.answer("⚠️ Admin only!", show_alert=True)
     prompt_id = next((pid for pid, data in _WRONG_SPELL_WAIT.items() if data["request_msg"].id == req_msg_id), None)
     if not prompt_id:
         return await query.answer("Nothing to cancel", show_alert=True)
-    
-    data = _WRONG_SPELL_WAIT.pop(prompt_id)
+
+    _WRONG_SPELL_WAIT.pop(prompt_id, None)
     try:
         await query.message.delete()
     except Exception:
@@ -379,24 +456,15 @@ async def cancel_wrong_callback(bot, query):
 async def custom_reply_callback(bot, query):
     """Handle custom reply - prompt admin for custom message."""
     _, user_id, msg_id = query.data.split("#")
-    chnl_id = query.message.chat.id
-    
-    try:
-        st = await bot.get_chat_member(chnl_id, query.from_user.id)
-        if st.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-            return await query.answer("⚠️ Admin only!", show_alert=True)
-    except Exception:
-        return await query.answer("⚠️ You are not a member of this channel, first join", show_alert=True)
-    
-    prompt = await bot.send_message(
-        chnl_id, "💬 <b>Send your custom reply message for the user</b>",
-        reply_to_message_id=query.message.id,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_custom#{query.message.id}")]])
+    if not await _is_channel_admin(bot, query.message.chat.id, query.from_user.id):
+        return await query.answer("⚠️ Admin only!", show_alert=True)
+
+    await _open_prompt(
+        bot, _CUSTOM_REPLY_WAIT, query.message,
+        "💬 <b>Reply to this message with your custom reply for the user</b>",
+        f"cancel_custom#{query.message.id}",
+        {"user_id": int(user_id), "msg_id": int(msg_id)},
     )
-    _CUSTOM_REPLY_WAIT[prompt.id] = {
-        "user_id": int(user_id), "msg_id": int(msg_id),
-        "request_msg": query.message, "prompt_id": prompt.id
-    }
     await query.answer()
 
 
@@ -405,11 +473,13 @@ async def cancel_custom_callback(bot, query):
     """Cancel custom reply prompt."""
     _, req_msg_id = query.data.split("#")
     req_msg_id = int(req_msg_id)
+    if not await _is_channel_admin(bot, query.message.chat.id, query.from_user.id):
+        return await query.answer("⚠️ Admin only!", show_alert=True)
     prompt_id = next((pid for pid, data in _CUSTOM_REPLY_WAIT.items() if data["request_msg"].id == req_msg_id), None)
     if not prompt_id:
         return await query.answer("Nothing to cancel", show_alert=True)
-    
-    data = _CUSTOM_REPLY_WAIT.pop(prompt_id)
+
+    _CUSTOM_REPLY_WAIT.pop(prompt_id, None)
     try:
         await query.message.delete()
     except Exception:
@@ -490,96 +560,115 @@ async def responded_alert_callback(bot, query):
         await query.answer("⚠️ Admin only!", show_alert=True)
 
 
-# Only fire when an admin is actually replying to one of THIS plugin's
-# prompts. A bare filters.private & filters.text also matches plain text and
-# every /command — and since Pyrogram runs only the first matching handler in
-# a group, that handler was registered before search.py/start.py (plugins
-# load alphabetically) and silently swallowed ALL private messages, leaving
-# the bot looking completely dead (no /start, no search, no /m).
-def _is_prompt_reply(_, __, message):
-    if not (message.chat and message.chat.type == enums.ChatType.PRIVATE):
-        return False
-    if not message.text:
-        return False
-    if not _CUSTOM_REPLY_WAIT and not _WRONG_SPELL_WAIT:
-        return False
-    if not message.reply_to_message:
-        return False
-    prompt_id = message.reply_to_message.id
-    in_custom = any(d["prompt_id"] == prompt_id for d in _CUSTOM_REPLY_WAIT.values())
-    in_wrong = any(d["prompt_id"] == prompt_id for d in _WRONG_SPELL_WAIT.values())
-    return in_custom or in_wrong
+# The prompts above are posted in the REQUEST CHANNEL (replying to the request
+# message), so the admin's answer arrives there too - not in a private chat.
+# (The old filter only looked at private chats, so replies were never seen.)
+# Only a reply to one of THIS plugin's prompts is handled; every other message
+# is left alone so nothing else in the bot is affected.
+def _is_request_channel(_, __, message):
+    return bool(REQUEST_CHANNEL) and message.chat is not None and message.chat.id == REQUEST_CHANNEL
 
 
-prompt_reply_filter = filters.create(_is_prompt_reply)
+request_channel_filter = filters.create(_is_request_channel)
 
 
-@Client.on_message(prompt_reply_filter)
+async def _sender_is_admin(bot, message) -> bool:
+    """Anyone who can post in a channel is already an admin. For a group-type
+    request chat, check the actual sender."""
+    user = message.from_user
+    if user is None:
+        # posted as the channel / anonymous admin itself
+        return message.sender_chat is None or message.sender_chat.id == message.chat.id
+    if user.id in ADMINS:
+        return True
+    return await _is_channel_admin(bot, message.chat.id, user.id)
+
+
+async def _deliver(bot, user_id: int, text: str, markup) -> bool:
+    try:
+        await bot.send_message(chat_id=user_id, text=text, reply_markup=markup)
+        return True
+    except UserIsBlocked:
+        return False
+    except RPCError:
+        logger.exception("Could not deliver request reply to %s", user_id)
+        return False
+
+
+async def _finish_request_message(bot, req_msg, label: str, alert_data: str):
+    """Strike through the request and replace its buttons with a status button."""
+    try:
+        await bot.edit_message_text(
+            req_msg.chat.id, req_msg.id,
+            f"<s>{html.escape(req_msg.text)}</s>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=alert_data)]])
+        )
+    except RPCError:
+        logger.debug("Could not edit request message %s", req_msg.id)
+
+
+@Client.on_message(request_channel_filter & filters.reply & filters.text, group=-2)
 async def handle_custom_reply_input(bot, message):
-    """Handle custom reply and wrong spelling input from admins."""
-    # Check if this is a response to a custom reply prompt
-    for prompt_id, data in list(_CUSTOM_REPLY_WAIT.items()):
-        if message.reply_to_message and message.reply_to_message.id == data["prompt_id"]:
-            user_id = data["user_id"]
-            msg_id = data["msg_id"]
+    """Handle the admin's custom reply / correct-spelling answer."""
+    prompt_id = message.reply_to_message_id
+    if prompt_id not in _CUSTOM_REPLY_WAIT and prompt_id not in _WRONG_SPELL_WAIT:
+        return      # ordinary message in the channel - not ours
+    if not await _sender_is_admin(bot, message):
+        return
+
+    try:
+        typed = message.text.strip()
+
+        # ── custom reply ────────────────────────────────────────────────
+        if prompt_id in _CUSTOM_REPLY_WAIT:
+            data = _CUSTOM_REPLY_WAIT.pop(prompt_id)
             req_msg = data["request_msg"]
-            
-            buttons = [[InlineKeyboardButton("💬 Admin Replied 💬", callback_data=f"responded_alert#{user_id}")]]
-            btn = [[InlineKeyboardButton("♻️ View Status ♻️", url=f"{req_msg.link}")]]
-            
-            try:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=CUSTOM_REPLY_TXT.format(
-                        requested_name=_requested_name(req_msg),
-                        custom_message=html.escape(message.text),
-                    ),
-                    reply_markup=InlineKeyboardMarkup(btn)
-                )
-            except UserIsBlocked:
-                pass
-            
-            await message.delete()
-            try:
-                await req_msg.edit_text(f"<s>{html.escape(req_msg.text)}</s>")
-                await req_msg.edit_reply_markup(InlineKeyboardMarkup(buttons))
-            except Exception:
-                pass
-            
-            _CUSTOM_REPLY_WAIT.pop(prompt_id)
-            return
-    
-    # Check if this is a response to a wrong spelling prompt
-    for prompt_id, data in list(_WRONG_SPELL_WAIT.items()):
-        if message.reply_to_message and message.reply_to_message.id == data["prompt_id"]:
             user_id = data["user_id"]
-            msg_id = data["msg_id"]
+
+            delivered = await _deliver(
+                bot, user_id,
+                CUSTOM_REPLY_TXT.format(
+                    requested_name=_requested_name(req_msg),
+                    custom_message=html.escape(typed),
+                ),
+                InlineKeyboardMarkup([[InlineKeyboardButton("♻️ View Status ♻️", url=req_msg.link)]])
+            )
+            status_label, alert = "💬 Admin Replied 💬", f"responded_alert#{user_id}"
+
+        # ── wrong spelling (uploaded / available) ───────────────────────
+        else:
+            data = _WRONG_SPELL_WAIT.pop(prompt_id)
             req_msg = data["request_msg"]
-            
-            buttons = [[InlineKeyboardButton("✏️ Correct Spelling ✏️", callback_data=f"ulws_alert#{user_id}")]]
-            btn = [[InlineKeyboardButton("♻️ View Status ♻️", url=f"{req_msg.link}")]]
-            
-            try:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=WRONG_SPELLING_TXT.format(
-                        requested_name=_requested_name(req_msg),
-                        correct_spelling=html.escape(message.text),
-                    ),
-                    reply_markup=InlineKeyboardMarkup(btn)
-                )
-            except UserIsBlocked:
-                pass
-            
-            await message.delete()
-            try:
-                await req_msg.edit_text(f"<s>{html.escape(req_msg.text)}</s>")
-                await req_msg.edit_reply_markup(InlineKeyboardMarkup(buttons))
-            except Exception:
-                pass
-            
-            _WRONG_SPELL_WAIT.pop(prompt_id)
-            return
+            user_id = data["user_id"]
+            is_uploaded = data.get("kind", "uploaded") == "uploaded"
+
+            template = UPLOADED_SPELLING_TXT if is_uploaded else AVAILABLE_SPELLING_TXT
+            delivered = await _deliver(
+                bot, user_id,
+                template.format(
+                    requested_name=_requested_name(req_msg),
+                    correct_spelling=html.escape(typed),
+                ),
+                InlineKeyboardMarkup([[InlineKeyboardButton("♻️ View Status ♻️", url=req_msg.link)]])
+            )
+            status_label = "✅ Uploaded, Spelling ✏️" if is_uploaded else "🫤 Available, Spelling ✏️"
+            alert = f"ulws_alert#{user_id}"
+
+        # Clean the channel: remove the admin's typed reply and the bot's prompt.
+        try:
+            await bot.delete_messages(message.chat.id, [message.id, prompt_id])
+        except Exception:
+            pass
+
+        await _finish_request_message(bot, req_msg, status_label, alert)
+
+        if not delivered:
+            await _temp_notice(
+                bot, message.chat.id,
+                "⚠️ Couldn't deliver the message - the user has blocked the bot or never started it."
+            )
+    finally:
+        message.stop_propagation()   # we own this reply; nothing else should react to it
 
 
 @Client.on_message(filters.command("req"))

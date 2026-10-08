@@ -10,7 +10,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserIsBlocked, RPCError
 
-from config import ADMINS, REQUEST_CHANNEL
+from config import ADMINS, REQUEST_CHANNEL, MOVIE_GROUP_LINK
 from database.request_db import add_request
 from database.settings_db import get_settings
 from utils import format_duration
@@ -47,6 +47,16 @@ def _requested_name(msg) -> str:
     m = re.search(r"Query:\s*(.*?)\s*(?:\n\s*\nPlease check|$)", text, re.S)
     name = m.group(1).strip() if m else ""
     return html.escape(name or "your request")
+
+
+def _status_rows(link) -> list:
+    """Button rows under every reply sent to the requester: View Status, plus
+    the movie group (MOVIE_GROUP_LINK in config.py) when it is set."""
+    rows = [[InlineKeyboardButton("♻️ View Status ♻️", url=link)]]
+    if MOVIE_GROUP_LINK:
+        rows.append([InlineKeyboardButton("🎬 Movie Group 🎬", url=MOVIE_GROUP_LINK)])
+    return rows
+
 
 # In-memory deduplication to prevent spam: user_id -> (key, sent request message)
 _REQUEST_DEDUP = {}
@@ -167,7 +177,7 @@ async def not_released_callback(bot, query):
     
     buttons = [[InlineKeyboardButton("🚫 Not Released 🚫", callback_data=f"na_alert#{user_id}")]]
     btn = [
-        [InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]
+        *_status_rows(f"{query.message.link}")
     ]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
@@ -197,7 +207,7 @@ async def not_available_callback(bot, query):
     
     buttons = [[InlineKeyboardButton("🚫 Not Available 🚫", callback_data=f"hm_alert#{user_id}")]]
     btn = [
-        [InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]
+        *_status_rows(f"{query.message.link}")
     ]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
@@ -226,7 +236,7 @@ async def uploaded_callback(bot, query):
     chnl_id = query.message.chat.id
     
     buttons = [[InlineKeyboardButton("🙂 Uploaded 🙂", callback_data=f"ul_alert#{user_id}")]]
-    btn = [[InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]]
+    btn = [*_status_rows(f"{query.message.link}")]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
     if st.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
@@ -255,7 +265,7 @@ async def already_available_callback(bot, query):
     
     buttons = [[InlineKeyboardButton("🫤 Already Available 🫤", callback_data=f"aa_alert#{user_id}")]]
     btn = [
-        [InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]
+        *_status_rows(f"{query.message.link}")
     ]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
@@ -285,7 +295,7 @@ async def upload_in_callback(bot, query):
     
     buttons = [[InlineKeyboardButton("⚠️ Check Your Spelling ⚠️", callback_data=f"upload_alert#{user_id}")]]
     btn = [
-        [InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]
+        *_status_rows(f"{query.message.link}")
     ]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
@@ -315,7 +325,7 @@ async def year_callback(bot, query):
     
     buttons = [[InlineKeyboardButton("⚠️ Tell Me Year/Language ⚠️", callback_data=f"yrs_alert#{user_id}")]]
     btn = [
-        [InlineKeyboardButton("♻️ View Status ♻️", url=f"{query.message.link}")]
+        *_status_rows(f"{query.message.link}")
     ]
     
     st = await bot.get_chat_member(chnl_id, query.from_user.id)
@@ -631,7 +641,7 @@ async def handle_custom_reply_input(bot, message):
                     requested_name=_requested_name(req_msg),
                     custom_message=html.escape(typed),
                 ),
-                InlineKeyboardMarkup([[InlineKeyboardButton("♻️ View Status ♻️", url=req_msg.link)]])
+                InlineKeyboardMarkup([*_status_rows(req_msg.link)])
             )
             status_label, alert = "💬 Admin Replied 💬", f"responded_alert#{user_id}"
 
@@ -649,7 +659,7 @@ async def handle_custom_reply_input(bot, message):
                     requested_name=_requested_name(req_msg),
                     correct_spelling=html.escape(typed),
                 ),
-                InlineKeyboardMarkup([[InlineKeyboardButton("♻️ View Status ♻️", url=req_msg.link)]])
+                InlineKeyboardMarkup([*_status_rows(req_msg.link)])
             )
             status_label = "✅ Uploaded, Spelling ✏️" if is_uploaded else "🫤 Available, Spelling ✏️"
             alert = f"ulws_alert#{user_id}"

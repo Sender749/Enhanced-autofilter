@@ -132,6 +132,12 @@ STREAM_MAX_PER_LINK = int(os.environ.get("STREAM_MAX_PER_LINK", "8"))    # downl
 FASTDL_ENABLED = bool(BIN_CHANNEL and STREAM_SECRET and (STREAM_BASE_URL or ORACLE_STREAM_URL))
 FASTDL_SERVER_ENABLED = bool(BIN_CHANNEL and STREAM_SECRET)
 
+# ── Web app (Telegram Mini App) ─────────────────────────────────────────────
+WEBAPP_ENABLED = _bool("WEBAPP_ENABLED", True)
+# Public https URL where /app is served. Defaults to the stream base URL (same Koyeb service).
+WEBAPP_URL = (os.environ.get("WEBAPP_URL", "").strip() or STREAM_BASE_URL).rstrip("/")
+WEBAPP_SYNC_SECONDS = int(os.environ.get("WEBAPP_SYNC_SECONDS", "600"))  # how often new files are added to the catalog
+
 # ── Fail fast on missing essentials instead of crashing deep in pyrogram ────
 _REQUIRED = {
     "API_ID": API_ID,

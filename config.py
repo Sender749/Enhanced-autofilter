@@ -135,7 +135,7 @@ FASTDL_SERVER_ENABLED = bool(BIN_CHANNEL and STREAM_SECRET)
 # ── Web app (Telegram Mini App) ─────────────────────────────────────────────
 WEBAPP_ENABLED = _bool("WEBAPP_ENABLED", True)
 # Public https URL where /app is served. Defaults to the stream base URL (same Koyeb service).
-WEBAPP_URL = (os.environ.get("WEBAPP_URL", "").strip() or STREAM_BASE_URL).rstrip("/")
+WEBAPP_URL = (os.environ.get("WEBAPP_URL", "https://internal-raychel-filetokensender-50bf89aa.koyeb.app/").strip() or STREAM_BASE_URL).rstrip("/")
 WEBAPP_SYNC_SECONDS = int(os.environ.get("WEBAPP_SYNC_SECONDS", "600"))  # how often new files are added to the catalog
 
 # ── Fail fast on missing essentials instead of crashing deep in pyrogram ────

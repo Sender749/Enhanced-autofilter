@@ -12,7 +12,6 @@ import asyncio
 import logging
 import re
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp import web
@@ -34,10 +33,11 @@ from fastdl.links import build_url, is_video
 from utils import temp
 from webapp.auth import validate_init_data
 from webapp.catalog import titles, items, lists, tokens
+from webapp.page import HTML
+from webapp.parser import print_rank
 
 logger = logging.getLogger(__name__)
 
-INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 NEW_DAYS = 3
 _cache: dict = {}
 _names: dict = {"at": 0, "ids": [], "norm": []}
@@ -47,7 +47,9 @@ _links: dict = {}  # (user, file) -> (time, payload)  so re-taps don't burn quot
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _json(data, status=200):
-    return web.json_response(data, status=status, headers={"Cache-Control": "private, no-store"})
+    resp = web.json_response(data, status=status, headers={"Cache-Control": "private, no-store"})
+    resp.enable_compression()
+    return resp
 
 
 def _user(request):
@@ -65,62 +67,135 @@ def _card(t: dict) -> dict:
     }
 
 
+_FIELDS = {"name": 1, "display_name": 1, "year": 1, "kind": 1, "poster": 1, "backdrop": 1, "rating": 1,
+           "qualities": 1, "langs": 1, "last_indexed_at": 1, "seasons": 1, "overview": 1, "genres": 1}
+
+
 async def _rows(query: dict, sort: str, limit: int = 20, skip: int = 0, direction=DESCENDING) -> list:
-    cur = titles.find(query).sort(sort, direction).skip(skip).limit(limit)
+    cur = titles.find(query, _FIELDS).sort(sort, direction).skip(skip).limit(limit)
     return [_card(t) async for t in cur]
 
 
+def _categories() -> dict:
+    """key -> (title, mongo query, sort field). Home rows and their "View all" pages share these,
+    so a row and its full list can never disagree."""
+    return {
+        "recent": ("Recently added", {}, "last_indexed_at"),
+        "released": ("New releases", {"release_ts": {"$lte": time.time()}, "meta_status": "ok"}, "release_ts"),
+        "movies": ("Movies", {"kind": "movie"}, "last_indexed_at"),
+        "series": ("Web series", {"kind": "series"}, "last_indexed_at"),
+        "anime": ("Anime", {"kind": "anime"}, "last_indexed_at"),
+        "hindi": ("Hindi", {"langs": "hindi"}, "last_indexed_at"),
+        "punjabi": ("Punjabi", {"langs": "punjabi"}, "last_indexed_at"),
+    }
+
+
+_refreshing: set = set()
+
+
 async def _cached(key: str, ttl: int, fn):
+    """Stale-while-revalidate: a cached value is returned instantly even when it's old,
+    and a background refresh is started, so users never wait for the database after the first load."""
     hit = _cache.get(key)
-    if hit and time.time() - hit[0] < ttl:
+    now = time.time()
+    if hit:
+        if now - hit[0] > ttl and key not in _refreshing:
+            _refreshing.add(key)
+
+            async def _refresh():
+                try:
+                    _cache[key] = (time.time(), await fn())
+                except Exception:
+                    logger.warning("cache refresh failed for %s", key, exc_info=True)
+                finally:
+                    _refreshing.discard(key)
+            asyncio.create_task(_refresh())
         return hit[1]
     val = await fn()
     _cache[key] = (time.time(), val)
     return val
 
 
+async def warm_loop():
+    """Keeps the home page ready so the app opens instantly."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            _cache["home"] = (time.time(), await _home_data())
+        except Exception:
+            logger.warning("home warm-up failed", exc_info=True)
+        await asyncio.sleep(90)
+
+
 # ── routes ───────────────────────────────────────────────────────────────────
 
 async def page(_request):
-    return web.FileResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
+    resp = web.Response(text=HTML, content_type="text/html", headers={"Cache-Control": "no-cache"})
+    resp.enable_compression()
+    return resp
 
 
 async def _home_data():
-    now = time.time()
-    hero_cur = titles.find({"meta_status": "ok", "backdrop": {"$ne": None}}).sort("last_indexed_at", DESCENDING).limit(6)
-    hero = [{**_card(t), "overview": t.get("overview"), "genres": t.get("genres")} async for t in hero_cur]
-    rows = [
-        {"key": "recent", "title": "Recently added", "items": await _rows({}, "last_indexed_at")},
-        {"key": "released", "title": "New releases",
-         "items": await _rows({"release_ts": {"$lte": now}, "meta_status": "ok"}, "release_ts")},
-        {"key": "trending", "title": "Trending", "items": await _trending()},
-        {"key": "movies", "title": "Movies", "items": await _rows({"kind": "movie", "meta_status": "ok"}, "last_indexed_at")},
-        {"key": "series", "title": "Web series", "items": await _rows({"kind": "series", "meta_status": "ok"}, "last_indexed_at")},
-        {"key": "anime", "title": "Anime", "items": await _rows({"kind": "anime"}, "last_indexed_at")},
-        {"key": "hindi", "title": "Hindi", "items": await _rows({"langs": "hindi", "meta_status": "ok"}, "last_indexed_at")},
-        {"key": "punjabi", "title": "Punjabi", "items": await _rows({"langs": "punjabi"}, "last_indexed_at")},
-    ]
-    return {"hero": hero, "rows": [r for r in rows if r["items"]]}
+    cats = _categories()
+    hero_q = titles.find({"meta_status": "ok", "backdrop": {"$ne": None}}, _FIELDS).sort("last_indexed_at", DESCENDING).limit(6)
+
+    async def hero_rows():
+        return [{**_card(t), "overview": t.get("overview"), "genres": t.get("genres")} async for t in hero_q]
+
+    keys = list(cats)
+    results = await asyncio.gather(
+        hero_rows(), _cached("trending", 600, _trending),
+        *(_rows(cats[k][1], cats[k][2]) for k in keys))
+    hero, trending, rows = results[0], results[1], dict(zip(keys, results[2:]))
+    order = ["recent", "released", "trending", "movies", "series", "anime", "hindi", "punjabi"]
+    out = []
+    for k in order:
+        if k == "trending":
+            out.append({"key": k, "title": "Trending", "items": trending})
+        else:
+            out.append({"key": k, "title": cats[k][0], "items": rows[k]})
+    return {"hero": hero, "rows": [r for r in out if r["items"]]}
 
 
 async def _trending() -> list:
     docs, _ = await trending_db.get_page(0, 14)
-    out, seen = [], set()
-    for d in docs:
+
+    async def one(d):
         toks = tokens(d.get("name", ""))
         if not toks:
-            continue
-        t = await titles.find_one({"words": {"$all": toks[:4]}, "meta_status": "ok"}, sort=[("last_indexed_at", -1)])
+            return None
+        return await titles.find_one({"words": {"$all": toks[:4]}}, _FIELDS, sort=[("last_indexed_at", -1)])
+
+    found = await asyncio.gather(*(one(d) for d in docs))
+    out, seen = [], set()
+    for t in found:
         if t and t["_id"] not in seen:
             seen.add(t["_id"])
             out.append(_card(t))
     return out
 
 
+async def category(request):
+    """Full list behind a home row's "View all" button."""
+    if not _user(request):
+        return _json({"error": "auth"}, 401)
+    key = request.match_info["key"]
+    page_no = max(0, int(request.query.get("page", "0") or 0))
+    size = 30
+    if key == "trending":
+        items_ = await _cached("trending", 600, _trending)
+        return _json({"title": "Trending", "items": items_, "more": False})
+    cat = _categories().get(key)
+    if not cat:
+        return _json({"error": "not_found"}, 404)
+    cards = await _rows(cat[1], cat[2], size, page_no * size)
+    return _json({"title": cat[0], "items": cards, "more": len(cards) == size})
+
+
 async def home(request):
     if not _user(request):
         return _json({"error": "auth"}, 401)
-    return _json(await _cached("home", 60, _home_data))
+    return _json(await _cached("home", 90, _home_data))
 
 
 async def _load_names():
@@ -174,10 +249,10 @@ async def search(request):
     return _json({"items": cards, "page": page_no, "more": len(cards) == size})
 
 
-def _file(it: dict, combined: bool = False, rng: str = "") -> dict:
+def _file(it: dict) -> dict:
     return {
         "id": str(it["_id"]), "quality": it.get("quality"), "langs": it.get("langs") or [],
-        "size": it.get("size") or 0, "label": it.get("label") or "", "combined": combined, "range": rng,
+        "size": it.get("size") or 0, "label": it.get("label") or "",
         "video": (it.get("mime") or "").startswith("video/") or (it.get("label") or "").lower().endswith((".mkv", ".mp4", ".webm")),
     }
 
@@ -187,6 +262,25 @@ def _qkey(f: dict) -> int:
         return -int((f.get("quality") or "0p")[:-1])
     except ValueError:
         return 0
+
+
+def _best(its: list) -> list:
+    """Good prints only, one file per quality.
+    1) keep only the best print tier present (a WEB-DL/BluRay title hides its HDRip/CAM copies;
+       if only CAM-type prints exist they are all kept so the title isn't empty);
+    2) per quality (480p, 720p, 1080p ...) keep one file: best print, then more audio languages, then larger."""
+    if not its:
+        return []
+    ranked = [(print_rank(i.get("label", "")), i) for i in its]
+    top = max(r for r, _ in ranked)
+    keep = [(r, i) for r, i in ranked if top <= 30 or r >= top - 15]
+    by_q: dict = {}
+    for r, i in keep:
+        score = (r, len(i.get("langs") or []), i.get("size") or 0)
+        k = i.get("quality") or "?"
+        if k not in by_q or score > by_q[k][0]:
+            by_q[k] = (score, i)
+    return sorted((_file(i) for _, i in by_q.values()), key=_qkey)
 
 
 async def title(request):
@@ -199,8 +293,7 @@ async def title(request):
            "release_date": t.get("release_date"), "seasons_list": t.get("seasons") or [],
            "file_count": t.get("file_count")}
     if t.get("kind") == "movie":
-        fl = [_file(i) async for i in items.find({"tkey": t["_id"]}).sort("indexed_at", DESCENDING).limit(200)]
-        out["files"] = sorted(fl, key=_qkey)
+        out["files"] = _best([i async for i in items.find({"tkey": t["_id"]}).limit(300)])
     else:
         # Seasons with no season number (episode-only captions) use key 0.
         seen = set(await items.distinct("season", {"tkey": t["_id"]}))
@@ -209,29 +302,31 @@ async def title(request):
 
 
 async def season(request):
-    """Episodes of one season. Combined files appear under every episode they
-    cover; full-season packs and files with no episode info are listed apart."""
+    """One season: single episodes first; combined-episode files and full-season packs are
+    plain rows listed below them (no extra tags). Each list shows good prints, one per quality."""
     if not _user(request):
         return _json({"error": "auth"}, 401)
     tid, n = request.match_info["id"], int(request.match_info["n"])
     q = {"tkey": tid, "season": None if n == 0 else n}
-    eps: dict = {}
+    singles: dict = {}
+    combined: dict = {}
     packs, extras = [], []
-    async for it in items.find(q).sort("indexed_at", DESCENDING).limit(2000):
+    async for it in items.find(q).limit(2500):
         if it.get("bonus"):
-            extras.append(_file(it))
+            extras.append(it)
         elif it.get("ep_from") is not None:
-            a, b = it["ep_from"], min(it["ep_to"], it["ep_from"] + 120)
-            combined = b > a
-            rng = f"Eps {it['ep_from']}-{it['ep_to']}" if combined else ""
-            for e in range(a, b + 1):
-                eps.setdefault(e, []).append(_file(it, combined, rng))
+            if it["ep_to"] > it["ep_from"]:
+                combined.setdefault((it["ep_from"], it["ep_to"]), []).append(it)
+            else:
+                singles.setdefault(it["ep_from"], []).append(it)
         elif it.get("pack"):
-            packs.append(_file(it))
+            packs.append(it)
         else:
-            extras.append(_file(it))
-    episodes = [{"ep": e, "files": sorted(fs, key=_qkey)} for e, fs in sorted(eps.items())]
-    return _json({"season": n, "episodes": episodes, "packs": sorted(packs, key=_qkey), "extras": sorted(extras, key=_qkey)})
+            extras.append(it)
+    episodes = [{"ep": e, "files": _best(fs)} for e, fs in sorted(singles.items())]
+    comb_files = [f for rng in sorted(combined) for f in _best(combined[rng])]
+    return _json({"season": n, "episodes": episodes, "combined": comb_files,
+                  "packs": _best(packs), "extras": _best(extras)})
 
 
 async def link(request):
@@ -297,7 +392,10 @@ async def send_dm(request):
         return _json({"error": "bad file"}, 400)
     from plugins.deliver import deliver_file
     task = asyncio.create_task(deliver_file(temp.BOT, user["id"], file_id))
-    task.add_done_callback(lambda t: t.exception() and logger.warning("webapp send failed: %s", t.exception()))
+    done, _ = await asyncio.wait({task}, timeout=4)  # usually delivered within a second or two
+    if task in done and task.exception():
+        logger.warning("webapp send failed: %s", task.exception())
+        return _json({"error": "Couldn't send the file. Open the bot and press Start, then try again."}, 500)
     return _json({"ok": True, "bot": temp.U_NAME})
 
 
@@ -337,7 +435,7 @@ async def config(request):
 def register_routes(app: web.Application):
     app.add_routes([
         web.get("/app", page), web.get("/app/", page),
-        web.get("/api/config", config), web.get("/api/home", home), web.get("/api/search", search),
+        web.get("/api/config", config), web.get("/api/home", home), web.get("/api/category/{key}", category), web.get("/api/search", search),
         web.get("/api/title/{id}", title), web.get("/api/title/{id}/season/{n}", season),
         web.post("/api/link", link), web.post("/api/send", send_dm),
         web.get("/api/mylist", mylist), web.post("/api/mylist", mylist),

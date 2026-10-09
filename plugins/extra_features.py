@@ -772,7 +772,8 @@ async def resolve_delete_items(bot, items: list, on_progress=None) -> dict:
             scanned += len(ids)
             continue
         scanned += len(ids)
-        for mid, msg in zip(ids, msgs):
+        skipped += max(len(ids) - len(msgs), 0)
+        for msg in msgs:
             media = None if (not msg or msg.empty) else (msg.document or msg.video)
             if not media:
                 skipped += 1
@@ -781,7 +782,11 @@ async def resolve_delete_items(bot, items: list, on_progress=None) -> dict:
             if uid in seen_uids:
                 continue
             seen_uids.add(uid)
-            targets.append({"chat": chat, "mid": mid, "uid": uid, "doc": None,
+            try:
+                posted = msg.date.timestamp() if msg.date else 0
+            except Exception:
+                posted = 0
+            targets.append({"chat": chat, "mid": msg.id, "uid": uid, "doc": None, "ts": posted,
                             "name": getattr(media, "file_name", None) or "file"})
 
     # 3) which of them are in the database?
@@ -804,13 +809,14 @@ async def resolve_delete_items(bot, items: list, on_progress=None) -> dict:
             continue
         if uid:
             seen_uids.add(uid)
-        targets.append({"chat": None, "mid": None, "uid": uid, "doc": doc, "name": display_name(doc)})
+        targets.append({"chat": None, "mid": None, "uid": uid, "doc": doc, "ts": 0, "name": display_name(doc)})
 
     return {"targets": targets, "skipped": skipped, "notes": notes, "missing_links": missing_links}
 
 
-def _del_confirm(tok: str, res: dict, items: list) -> tuple:
+def _del_confirm(tok: str, res: dict, items: list, problems: dict | None = None) -> tuple:
     targets = res["targets"]
+    problems = problems or {}
     in_db = sum(1 for t in targets if t["doc"])
     on_channel = sum(1 for t in targets if t["chat"] is not None)
     links = sum(1 for i in items if i["kind"] != "range")
@@ -847,6 +853,19 @@ def _del_confirm(tok: str, res: dict, items: list) -> tuple:
             text += f"\n… and <b>{len(names) - _DEL_PREVIEW}</b> more"
     if res["notes"]:
         text += "\n\n" + "\n".join(res["notes"])
+
+    # pre-flight checks, so problems show up BEFORE anything is deleted
+    if on_channel:
+        text += "\n"
+        for chat, why in problems.items():
+            text += f"\n⚠️ <code>{esc(str(chat))}</code>: {esc(why)}."
+        if not problems:
+            text += "\n🔑 Bot can delete messages in the channel ✅"
+        now = time.time()
+        old = sum(1 for t in targets if t["chat"] is not None and t.get("ts") and now - t["ts"] >= _BOT_MAX_AGE)
+        if old:
+            text += (f"\n🕒 <b>{old}</b> file(s) were posted more than 48 h ago — Telegram normally refuses bot "
+                     f"deletions that old{'; the user session will be tried' if _DEL_SESSION else ' (use “Delete from database” for those, or set DELETE_SESSION_STRING)'}.")
 
     rows = []
     if in_db and on_channel:
@@ -902,53 +921,105 @@ async def delete_cmd(bot, message):
         await _safe_edit(status, text)
         return
 
+    problems = {}
+    for chat in {t["chat"] for t in res["targets"] if t["chat"] is not None}:
+        why = await _bot_rights_problem(bot, chat)
+        if why:
+            problems[chat] = why
     tok = secrets.token_hex(4)
     _purge(_pending_del, 600)
     _pending_del[tok] = {"admin": message.from_user.id, "ts": time.time(), "targets": res["targets"]}
-    text, markup = _del_confirm(tok, res, items)
+    text, markup = _del_confirm(tok, res, items, problems)
     await _safe_edit(status, text, markup)
 
 
-_PERMISSION_ERRORS = ("ChatAdminRequired", "MessageDeleteForbidden", "ChatWriteForbidden",
-                      "ChannelPrivate", "ChannelInvalid", "PeerIdInvalid", "UserNotParticipant")
+# Errors that mean the whole channel is the problem (not one particular message).
+_HARD_ERRORS = ("ChatAdminRequired", "ChatWriteForbidden", "ChannelPrivate", "ChannelInvalid",
+                "PeerIdInvalid", "UserNotParticipant")
+_BOT_MAX_AGE = 47 * 3600     # Telegram normally refuses bot deletions of messages older than ~48 h
+
+# Optional: a channel admin's *user* session. Bots can't delete old messages, a user admin can.
+# Set the env var DELETE_SESSION_STRING (Pyrogram string session) to turn this on. Off by default.
+_DEL_SESSION = os.environ.get("DELETE_SESSION_STRING", "").strip()
+_user_client = None
+_user_client_failed = False
+_user_client_lock = asyncio.Lock()
 
 
-async def _delete_channel_chunk(bot, chat, chunk: list) -> tuple:
-    """Delete up to 100 channel messages. Returns (done_targets, [(failed_target, reason)])."""
-    ids = [t["mid"] for t in chunk]
-    for attempt in (1, 2):
+async def _get_user_client():
+    global _user_client, _user_client_failed
+    if not _DEL_SESSION or _user_client_failed:
+        return None
+    async with _user_client_lock:
+        if _user_client is None and not _user_client_failed:
+            try:
+                from config import API_ID, API_HASH
+                client = Client("delete-session", api_id=API_ID, api_hash=API_HASH,
+                                session_string=_DEL_SESSION, in_memory=True, no_updates=True)
+                await client.start()
+                try:                                   # caches channel access hashes for -100… ids
+                    async for _ in client.get_dialogs(limit=1500):
+                        pass
+                except Exception:
+                    logger.debug("user session: get_dialogs failed", exc_info=True)
+                _user_client = client
+            except Exception:
+                _user_client_failed = True
+                logger.exception("DELETE_SESSION_STRING is set but the user session couldn't start")
+        return _user_client
+
+
+async def _call_delete(client, chat, ids: list):
+    for attempt in (1, 2, 3):
         try:
-            n = await bot.delete_messages(chat, ids)
-            if n >= len(ids):
-                return chunk, []
-            break                                   # some weren't there — check one by one
+            return await client.delete_messages(chat, ids)
         except FloodWait as e:
-            if attempt == 2:
-                break
-            await asyncio.sleep(e.value + 1)
-        except RPCError as e:
-            reason = e.__class__.__name__
-            if reason in _PERMISSION_ERRORS:        # no point retrying each file
-                return [], [(t, reason) for t in chunk]
-            break
-    done, failed = [], []
-    for t in chunk:
-        try:
-            await bot.delete_messages(chat, t["mid"])   # 0 = already gone, which is fine too
-            done.append(t)
-        except FloodWait as e:
-            await asyncio.sleep(e.value + 1)
-            failed.append((t, "FloodWait"))
-        except RPCError as e:
-            failed.append((t, e.__class__.__name__))
-    return done, failed
+            if attempt == 3:
+                raise
+            await asyncio.sleep(min(e.value, 30) + 1)
+
+
+async def _delete_with(client, chat, chunk: list) -> tuple:
+    """Delete these channel messages with `client`. Returns (deleted, [(target, reason)]).
+    One undeletable message makes Telegram reject the whole request, so on a refusal the
+    group is split in half again and again until the bad ones are isolated — the rest still go."""
+    if not chunk:
+        return [], []
+    try:
+        await _call_delete(client, chat, [t["mid"] for t in chunk])
+        return chunk, []
+    except RPCError as e:
+        reason = e.__class__.__name__
+        if reason in _HARD_ERRORS or len(chunk) == 1:
+            return [], [(t, reason) for t in chunk]
+    half = len(chunk) // 2
+    a_ok, a_bad = await _delete_with(client, chat, chunk[:half])
+    b_ok, b_bad = await _delete_with(client, chat, chunk[half:])
+    return a_ok + b_ok, a_bad + b_bad
+
+
+async def _bot_rights_problem(bot, chat):
+    """None if the bot can delete messages in `chat`, else a short reason."""
+    try:
+        member = await bot.get_chat_member(chat, "me")
+    except UserNotParticipant:
+        return "the bot is not a member of it"
+    except RPCError as e:
+        return f"couldn't check the bot's rights ({e.__class__.__name__})"
+    if member.status == enums.ChatMemberStatus.OWNER:
+        return None
+    if member.status != enums.ChatMemberStatus.ADMINISTRATOR:
+        return "the bot is not an admin there"
+    if not member.privileges or not member.privileges.can_delete_messages:
+        return "the bot is an admin but lacks the “Delete messages” permission"
+    return None
 
 
 async def _run_delete(bot, status, tok: str, targets: list, action: str):
     job = _del_jobs[tok] = {"cancel": False}
     total = len(targets)
-    st = {"done": 0, "ch_ok": 0, "ch_fail": 0, "db_ok": 0, "db_missing": 0}
-    failed, reasons = [], {}
+    st = {"done": 0, "ch_ok": 0, "ch_fail": 0, "via_user": 0, "db_ok": 0, "db_missing": 0}
+    failed, reasons, failed_targets = [], {}, []
     start, throttle = time.time(), Throttle(2.5)
     stop_btn = Markup([[Btn("⛔ Stop", callback_data=f"dl#stop#{tok}")]])
     title = "🗑 <b>Deleting…</b>"
@@ -993,17 +1064,45 @@ async def _run_delete(bot, status, tok: str, targets: list, action: str):
             by_chat: dict = {}
             for t in channel_targets:
                 by_chat.setdefault(t["chat"], []).append(t)
+            user_client = await _get_user_client() if by_chat else None
+
             for chat, group in by_chat.items():
+                old_blocked = False          # bot was refused on several old messages in a row
                 for i in range(0, len(group), 100):
                     if job["cancel"]:
                         break
                     chunk = group[i:i + 100]
-                    ok, bad = await _delete_channel_chunk(bot, chat, chunk)
+                    now = time.time()
+                    old_ids = {t["mid"] for t in chunk if t["ts"] and now - t["ts"] >= _BOT_MAX_AGE}
+                    # once the bot is known to be refused on old posts, don't keep asking it
+                    to_bot = [t for t in chunk if not (old_blocked and t["mid"] in old_ids)]
+                    ok, bad = await _delete_with(bot, chat, to_bot)
+                    bad = list(bad) + [(t, "TooOld") for t in chunk if old_blocked and t["mid"] in old_ids]
+
+                    # learn from this batch (needs a few old posts to be sure)
+                    tried_old = [t for t in to_bot if t["mid"] in old_ids]
+                    if len(tried_old) >= 3:
+                        old_refused = sum(1 for t, r in bad if t["mid"] in old_ids and r == "MessageDeleteForbidden")
+                        if old_refused == len(tried_old):
+                            old_blocked = True
+                        elif old_refused < len(tried_old):
+                            old_blocked = False
+
+                    # whatever the bot couldn't delete: try the optional user session
+                    if bad and user_client is not None:
+                        retry = [t for t, _ in bad]
+                        u_ok, u_bad = await _delete_with(user_client, chat, retry)
+                        st["via_user"] += len(u_ok)
+                        ok = ok + u_ok
+                        bad = [(t, f"user session: {r}") for t, r in u_bad]
+
                     st["ch_ok"] += len(ok)
                     st["ch_fail"] += len(bad)
                     for t, why in bad:
+                        why = "older than 48 h" if why == "TooOld" else why
                         reasons[why] = reasons.get(why, 0) + 1
-                        failed.append((t["name"], why))
+                        failed.append((t["name"], why, t["mid"] in old_ids))
+                        failed_targets.append(t)
                     if action == "both" and ok:
                         await remove_from_db(ok)
                     st["done"] += len(chunk)
@@ -1025,6 +1124,8 @@ async def _run_delete(bot, status, tok: str, targets: list, action: str):
             lines.append(f"✔️ Processed before stopping: <code>{st['done']}</code>")
         if action in ("both", "ch"):
             lines.append(f"📢 Channel: ✅ <code>{st['ch_ok']}</code> deleted · ❌ <code>{st['ch_fail']}</code> failed")
+            if st["via_user"]:
+                lines.append(f"👤 <code>{st['via_user']}</code> of them were deleted with the user session")
         if action in ("both", "db"):
             line = f"🗄 Database: ✅ <code>{st['db_ok']}</code> deleted"
             if st["db_missing"]:
@@ -1032,14 +1133,39 @@ async def _run_delete(bot, status, tok: str, targets: list, action: str):
             lines.append(line)
         if action == "both" and st["ch_fail"]:
             lines.append(f"⏸ Database records of the <code>{st['ch_fail']}</code> failed files were left untouched.")
+
+        markup = None
         if failed:
             lines.append("\n<b>Failed:</b>")
-            lines += [f"• <code>{esc(n[:60])}</code> — {esc(w)}" for n, w in failed[:8]]
+            lines += [f"• <code>{esc(n[:60])}</code> — {esc(w)}" for n, w, _old in failed[:8]]
             if len(failed) > 8:
                 lines.append(f"… and {len(failed) - 8} more")
-            if any(r in _PERMISSION_ERRORS for r in reasons):
-                lines.append("\n💡 Make the bot an admin of that channel with the <i>Delete messages</i> permission.")
-        await _safe_edit(status, "\n".join(lines))
+            old_failed = sum(1 for _n, w, old in failed if old and ("MessageDeleteForbidden" in w or w == "older than 48 h"))
+            recent_refused = sum(1 for _n, w, old in failed if not old and "MessageDeleteForbidden" in w)
+            hard = any(any(h in w for h in _HARD_ERRORS) for w in reasons)
+            lines.append("")
+            if old_failed:
+                lines.append(
+                    f"🕒 <b>{old_failed}</b> of these were posted more than 48 hours ago. Telegram refuses to let "
+                    f"<i>bots</i> delete messages that old, even as admin with every permission."
+                )
+                if not _DEL_SESSION:
+                    lines.append("💡 Delete them by hand in the channel, or set <code>DELETE_SESSION_STRING</code> "
+                                 "(a channel admin's user session) so I can do it.")
+                elif _user_client is None:
+                    lines.append("👤 <code>DELETE_SESSION_STRING</code> is set but that session couldn't start — see the logs.")
+                else:
+                    lines.append("👤 The user session was tried too — make sure that account is an admin of the channel with the Delete permission.")
+            if hard:
+                lines.append("🔑 The bot can't delete in this channel — make it an admin with the <i>Delete messages</i> permission.")
+            if recent_refused:
+                lines.append(f"⚠️ <b>{recent_refused}</b> recent message(s) were refused too — check the bot's rights in that channel, "
+                             "or they may be service messages.")
+            if action == "both" and failed_targets:
+                tok2 = secrets.token_hex(4)
+                _pending_del[tok2] = {"admin": 0, "ts": time.time(), "targets": failed_targets}
+                markup = Markup([[Btn(f"🗄 Remove these {len(failed_targets)} from database only", callback_data=f"dl#db#{tok2}")]])
+        await _safe_edit(status, "\n".join(lines), markup)
     except Exception:
         logger.exception("/delete run crashed")
         await _safe_edit(status, f"❌ Stopped by an internal error after <code>{st['done']}</code> / <code>{total}</code> files — see the logs.")

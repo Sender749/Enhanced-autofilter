@@ -5,6 +5,7 @@ Extra admin features — drop-in plugin (auto-loaded, no other file needs editin
   2. /id           user info (clickable name, mono id, joined group(s))
   3. /ban /unban /showban   bot-level ban system (works in PM and in groups)
   4. /delete <link>, /deleteall   remove indexed files from MongoDB / channel
+                   /delete also takes several links (a, b, c) and ranges (start - end)
   5. /checklimit /resetlimit /resetlimitall   daily free-file limit control
   6. /show_groups /leave_groups   manage groups the bot is admin in
   7. /broadcast    any media type, optional pin, live progress, cancel + undo
@@ -623,118 +624,451 @@ async def id_cmd(bot, message):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. /delete <file link>   /deleteall
+# 4. /delete <link | link1, link2 | start - end>   /deleteall
 # ══════════════════════════════════════════════════════════════════════════════
 
-_pending_del: dict = {}
-_CHANNEL_LINK = re.compile(r"t\.me/(?:c/(\d+)|([A-Za-z][A-Za-z0-9_]{3,}))/(?:\d+/)?(\d+)")
-_BOT_FILE_LINK = re.compile(r"[?&]start=file_([0-9a-fA-F]{24})")
+_pending_del: dict = {}     # token -> files found, waiting for the admin's button press
+_del_jobs: dict = {}        # token -> running delete job (lets the Stop button work)
+
+_DEL_MAX_IDS = 10000        # most message ids scanned in one /delete command
+_DEL_PREVIEW = 8            # file names shown on the confirm screen
+
+# One regex for both link kinds:
+#   channel post   t.me/c/1234567890/55   ·   t.me/channelname/55
+#   bot file link  t.me/botname?start=file_<24 hex chars>
+_DEL_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?t\.me/"
+    r"(?:(?:c/(?P<cid>\d+)|(?P<user>[A-Za-z][A-Za-z0-9_]{3,}))/(?:\d+/)?(?P<mid>\d+)(?:\?[A-Za-z0-9=&_%]*)?"
+    r"|(?P<bot>[A-Za-z][A-Za-z0-9_]{3,})\?start=file_(?P<oid>[0-9a-fA-F]{24}))"
+)
+_DEL_ITEM_SEP = re.compile(r"^[\s,;]*$")                    # between separate links
+_DEL_RANGE_SEP = re.compile(r"^\s*(?:[-–—~]|to)\s*$", re.I)  # between the two ends of a range
+
+_DEL_USAGE = (
+    "<b>Usage</b>\n\n"
+    "🔹 <b>One file</b>\n<code>/delete link</code>\n\n"
+    "🔹 <b>Several files</b> <i>(commas or new lines)</i>\n<code>/delete link1, link2, link3</code>\n\n"
+    "🔹 <b>Range</b> <i>(every file from start to end, same channel)</i>\n"
+    "<code>/delete start_link - end_link</code>\n\n"
+    "🔹 <b>Mix them</b>\n<code>/delete link1, start_link - end_link, link3</code>\n\n"
+    "<b>Links:</b> a channel post (<code>https://t.me/c/1234567890/55</code>) can be deleted from the "
+    "database and the channel. A bot file link (<code>t.me/bot?start=file_…</code>) can only be deleted "
+    "from the database, and can't be used in a range."
+)
+
+
+def _del_ref(m) -> dict:
+    if m.group("oid"):
+        return {"kind": "file", "oid": m.group("oid")}
+    chat = int("-100" + m.group("cid")) if m.group("cid") else m.group("user").lower()
+    return {"kind": "post", "chat": chat, "mid": int(m.group("mid"))}
+
+
+def parse_delete_args(raw: str):
+    """Turn the text after /delete into a list of items.
+    Returns (items, None) or (None, error_message).
+    Item = {"kind": "post", chat, mid} | {"kind": "file", oid} | {"kind": "range", chat, chat2, start, end}"""
+    matches = list(_DEL_LINK_RE.finditer(raw))
+    if not matches:
+        return None, "I couldn't find any channel post link or bot file link in that."
+    if not _DEL_ITEM_SEP.match(raw[:matches[0].start()]):
+        return None, f"Unexpected text before the first link: <code>{esc(raw[:matches[0].start()].strip()[:40])}</code>"
+    if not _DEL_ITEM_SEP.match(raw[matches[-1].end():]):
+        return None, f"Unexpected text after the last link: <code>{esc(raw[matches[-1].end():].strip()[:40])}</code>"
+
+    refs = [_del_ref(m) for m in matches]
+    gaps = [raw[matches[i].end():matches[i + 1].start()] for i in range(len(matches) - 1)]
+    items, i, n = [], 0, len(matches)
+    while i < n:
+        if i + 1 < n and _DEL_RANGE_SEP.match(gaps[i]):
+            a, b = refs[i], refs[i + 1]
+            if a["kind"] != "post" or b["kind"] != "post":
+                return None, "A range needs two <b>channel post</b> links — bot file links can't be used in a range."
+            if i + 2 < n and not _DEL_ITEM_SEP.match(gaps[i + 1]):
+                return None, "A range can only have two ends — use commas to add more links or ranges."
+            lo, hi = sorted((a["mid"], b["mid"]))
+            items.append({"kind": "range", "chat": a["chat"], "chat2": b["chat"], "start": lo, "end": hi})
+            i += 2
+            continue
+        if i + 1 < n and not _DEL_ITEM_SEP.match(gaps[i]):
+            return None, f"Don't know what <code>{esc(gaps[i].strip()[:40])}</code> means between two links."
+        items.append(refs[i])
+        i += 1
+    return items, None
+
+
+async def _get_messages_safe(bot, chat, ids: list, on_progress=None) -> list:
+    """get_messages in chunks of 200 (Telegram's cap), riding out flood waits."""
+    out = []
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        for attempt in (1, 2):
+            try:
+                out.extend(await bot.get_messages(chat, chunk))
+                break
+            except FloodWait as e:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(e.value + 1)
+        if on_progress:
+            await on_progress(len(out))
+    return out
+
+
+async def _docs_by_unique_id(uids: list) -> dict:
+    found = {}
+    for i in range(0, len(uids), 1000):
+        cursor = files.find({"file_unique_id": {"$in": uids[i:i + 1000]}},
+                            {"file_name": 1, "caption": 1, "file_unique_id": 1})
+        async for d in cursor:
+            found[d["file_unique_id"]] = d
+    return found
+
+
+async def resolve_delete_items(bot, items: list, on_progress=None) -> dict:
+    """Open every message the items point at and work out what can be deleted.
+    Returns {"targets": [...], "skipped": int, "notes": [html lines], "missing_links": int}"""
+    notes, skipped, missing_links = [], 0, 0
+
+    # 1) collect every (channel, message id) to look at — ranges are expanded here
+    per_chat: dict = {}
+    total_ids = 0
+    for it in items:
+        if it["kind"] == "post":
+            per_chat.setdefault(it["chat"], {})[it["mid"]] = None
+            total_ids += 1
+        elif it["kind"] == "range":
+            if it["chat"] != it["chat2"]:
+                ids = []
+                for c in (it["chat"], it["chat2"]):
+                    try:
+                        ids.append((await bot.get_chat(c)).id)
+                    except RPCError:
+                        return {"error": f"Couldn't open channel <code>{esc(str(c))}</code> — is the bot a member?"}
+                if ids[0] != ids[1]:
+                    return {"error": "Both ends of a range must be from the <b>same channel</b>."}
+            span = it["end"] - it["start"] + 1
+            total_ids += span
+            if total_ids > _DEL_MAX_IDS:
+                return {"error": f"That's more than <code>{_DEL_MAX_IDS}</code> messages in one go. Split it into smaller ranges."}
+            bucket = per_chat.setdefault(it["chat"], {})
+            for mid in range(it["start"], it["end"] + 1):
+                bucket[mid] = None
+
+    # 2) fetch the messages (200 per request) and keep documents / videos only
+    targets, seen_uids, scanned = [], set(), 0
+
+    async def progress(n):
+        if on_progress:
+            await on_progress(scanned + n, total_ids)
+
+    for chat, bucket in per_chat.items():
+        ids = list(bucket)
+        try:
+            msgs = await _get_messages_safe(bot, chat, ids, progress)
+        except RPCError as e:
+            notes.append(f"❌ Couldn't open <code>{esc(str(chat))}</code> ({e.__class__.__name__}) — is the bot in that channel?")
+            skipped += len(ids)
+            scanned += len(ids)
+            continue
+        scanned += len(ids)
+        for mid, msg in zip(ids, msgs):
+            media = None if (not msg or msg.empty) else (msg.document or msg.video)
+            if not media:
+                skipped += 1
+                continue
+            uid = media.file_unique_id
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            targets.append({"chat": chat, "mid": mid, "uid": uid, "doc": None,
+                            "name": getattr(media, "file_name", None) or "file"})
+
+    # 3) which of them are in the database?
+    docs = await _docs_by_unique_id([t["uid"] for t in targets])
+    for t in targets:
+        t["doc"] = docs.get(t["uid"])
+        if t["doc"]:
+            t["name"] = display_name(t["doc"])
+
+    # 4) bot file links (database only). A file already found via a post link is skipped.
+    for it in items:
+        if it["kind"] != "file":
+            continue
+        doc = await get_file_by_id(it["oid"])
+        if not doc:
+            missing_links += 1
+            continue
+        uid = doc.get("file_unique_id")
+        if uid and uid in seen_uids:
+            continue
+        if uid:
+            seen_uids.add(uid)
+        targets.append({"chat": None, "mid": None, "uid": uid, "doc": doc, "name": display_name(doc)})
+
+    return {"targets": targets, "skipped": skipped, "notes": notes, "missing_links": missing_links}
+
+
+def _del_confirm(tok: str, res: dict, items: list) -> tuple:
+    targets = res["targets"]
+    in_db = sum(1 for t in targets if t["doc"])
+    on_channel = sum(1 for t in targets if t["chat"] is not None)
+    links = sum(1 for i in items if i["kind"] != "range")
+    ranges = sum(1 for i in items if i["kind"] == "range")
+    names = [t["name"] for t in targets]
+
+    if len(targets) == 1 and len(items) == 1:
+        t = targets[0]
+        text = f"🗑 <b>Delete this file?</b>\n\n📄 <code>{esc(t['name'][:200])}</code>"
+        if not t["doc"]:
+            text += "\n⚠️ <i>This file is <b>not in the database</b>.</i>"
+        elif t["chat"] is None:
+            text += "\n<i>Channel delete needs a channel post link (bot file links don't contain the message id).</i>"
+    else:
+        head = []
+        if links:
+            head.append(f"{links} link{'s' if links != 1 else ''}")
+        if ranges:
+            head.append(f"{ranges} range{'s' if ranges != 1 else ''}")
+        text = (
+            f"🗑 <b>Delete {len(targets)} files?</b>\n<i>from {' + '.join(head)}</i>\n\n"
+            f"🗄 In database: <code>{in_db}</code>\n"
+            f"⚠️ Not in database: <code>{len(targets) - in_db}</code>\n"
+            f"📢 On a channel: <code>{on_channel}</code>"
+        )
+        if len(targets) - on_channel:
+            text += f"\n🔗 Bot file links (database only): <code>{len(targets) - on_channel}</code>"
+        if res["skipped"]:
+            text += f"\n⏭ Skipped (not a file / already deleted): <code>{res['skipped']}</code>"
+        if res["missing_links"]:
+            text += f"\n❓ Bot file links not in database: <code>{res['missing_links']}</code>"
+        text += "\n\n" + "\n".join(f"• <code>{esc(n[:70])}</code>" for n in names[:_DEL_PREVIEW])
+        if len(names) > _DEL_PREVIEW:
+            text += f"\n… and <b>{len(names) - _DEL_PREVIEW}</b> more"
+    if res["notes"]:
+        text += "\n\n" + "\n".join(res["notes"])
+
+    rows = []
+    if in_db and on_channel:
+        rows.append([Btn("🗄 Delete from database", callback_data=f"dl#db#{tok}")])
+        rows.append([Btn("🗄📢 Delete from database & channel", callback_data=f"dl#both#{tok}")])
+    elif in_db:
+        rows.append([Btn("🗄 Delete from database", callback_data=f"dl#db#{tok}")])
+    elif on_channel:
+        rows.append([Btn("📢 Delete from channel only", callback_data=f"dl#ch#{tok}")])
+    rows.append([Btn("✖️ Cancel", callback_data=f"dl#cancel#{tok}")])
+    return text, Markup(rows)
 
 
 @Client.on_message(filters.command("delete") & ADMIN)
 async def delete_cmd(bot, message):
-    link = message.command[1] if len(message.command) > 1 else ""
-    if not link:
-        await message.reply_text(
-            "<b>Usage:</b> <code>/delete file_link</code>\n\n"
-            "• Channel post link: <code>https://t.me/c/1234567890/55</code> — can delete from DB and channel\n"
-            "• Bot file link: <code>https://t.me/bot?start=file_…</code> — database only"
-        )
+    parts = message.text.split(None, 1)
+    raw = parts[1].strip() if len(parts) > 1 else ""
+    if not raw:
+        await message.reply_text(_DEL_USAGE, disable_web_page_preview=True)
+        return
+    items, err = parse_delete_args(raw)
+    if err:
+        await message.reply_text(f"❌ {err}\n\n<i>Send /delete alone to see how to use it.</i>")
         return
 
-    entry = {"admin": message.from_user.id, "ts": time.time(), "chat_id": None, "msg_id": None, "doc": None}
+    status = await message.reply_text("🔎 Looking up the files…")
+    throttle = Throttle(2.0)
 
-    m = _BOT_FILE_LINK.search(link)
-    if m:
-        doc = await get_file_by_id(m.group(1))
-        if not doc:
-            await message.reply_text("❌ That file isn't in the database (already deleted?).")
-            return
-        entry["doc"] = doc
-    else:
-        m = _CHANNEL_LINK.search(link)
-        if not m:
-            await message.reply_text("❌ That doesn't look like a channel post link or a bot file link.")
-            return
-        chat_id = int("-100" + m.group(1)) if m.group(1) else m.group(2)
-        msg_id = int(m.group(3))
-        try:
-            msg = await bot.get_messages(chat_id, msg_id)
-        except RPCError as e:
-            await message.reply_text(f"❌ Couldn't open that message: <code>{esc(str(e))}</code>")
-            return
-        media = None if (not msg or msg.empty) else (msg.document or msg.video)
-        if not media:
-            await message.reply_text("❌ No file found at that link (message deleted, or it isn't a document/video).")
-            return
-        entry.update(chat_id=chat_id, msg_id=msg_id)
-        entry["doc"] = await files.find_one({"file_unique_id": media.file_unique_id})
-        entry["unique_id"] = media.file_unique_id
-        entry["file_name"] = getattr(media, "file_name", None) or "file"
+    async def progress(done, total):
+        if throttle.ready():
+            await _safe_edit(status, f"🔎 Scanning messages…\n<code>{_bar(done, total)}</code> <code>{done}</code> / <code>{total}</code>")
 
-    doc = entry["doc"]
-    name = display_name(doc) if doc else entry.get("file_name", "file")
+    try:
+        res = await resolve_delete_items(bot, items, progress)
+    except FloodWait as e:
+        await _safe_edit(status, f"⏳ Telegram asked me to slow down — try again in {e.value}s.")
+        return
+    except Exception:
+        logger.exception("/delete lookup failed")
+        await _safe_edit(status, "❌ Something went wrong while looking up the files — see the logs.")
+        return
+    if "error" in res:
+        await _safe_edit(status, f"❌ {res['error']}")
+        return
+    if not res["targets"]:
+        text = "❌ <b>No deletable files found.</b>\n\nThe links point to messages that are deleted, or aren't documents/videos."
+        if res["skipped"]:
+            text += f"\n⏭ Skipped: <code>{res['skipped']}</code>"
+        if res["missing_links"]:
+            text += f"\n❓ Bot file links not in database: <code>{res['missing_links']}</code>"
+        if res["notes"]:
+            text += "\n\n" + "\n".join(res["notes"])
+        await _safe_edit(status, text)
+        return
+
     tok = secrets.token_hex(4)
     _purge(_pending_del, 600)
-    _pending_del[tok] = entry
+    _pending_del[tok] = {"admin": message.from_user.id, "ts": time.time(), "targets": res["targets"]}
+    text, markup = _del_confirm(tok, res, items)
+    await _safe_edit(status, text, markup)
 
-    rows = []
-    if doc and entry["chat_id"] is not None:
-        rows.append([Btn("🗄 Delete from database", callback_data=f"dl#db#{tok}")])
-        rows.append([Btn("🗄📢 Delete from database & channel", callback_data=f"dl#both#{tok}")])
-        note = ""
-    elif doc:
-        rows.append([Btn("🗄 Delete from database", callback_data=f"dl#db#{tok}")])
-        note = "\n<i>Channel delete needs a channel post link (bot file links don't contain the message id).</i>"
-    else:
-        rows.append([Btn("📢 Delete from channel only", callback_data=f"dl#ch#{tok}")])
-        note = "\n⚠️ <i>This file is <b>not in the database</b>.</i>"
-    rows.append([Btn("✖️ Cancel", callback_data=f"dl#cancel#{tok}")])
 
-    await message.reply_text(
-        f"🗑 <b>Delete this file?</b>\n\n📄 <code>{esc(name[:200])}</code>{note}",
-        reply_markup=Markup(rows),
-    )
+_PERMISSION_ERRORS = ("ChatAdminRequired", "MessageDeleteForbidden", "ChatWriteForbidden",
+                      "ChannelPrivate", "ChannelInvalid", "PeerIdInvalid", "UserNotParticipant")
+
+
+async def _delete_channel_chunk(bot, chat, chunk: list) -> tuple:
+    """Delete up to 100 channel messages. Returns (done_targets, [(failed_target, reason)])."""
+    ids = [t["mid"] for t in chunk]
+    for attempt in (1, 2):
+        try:
+            n = await bot.delete_messages(chat, ids)
+            if n >= len(ids):
+                return chunk, []
+            break                                   # some weren't there — check one by one
+        except FloodWait as e:
+            if attempt == 2:
+                break
+            await asyncio.sleep(e.value + 1)
+        except RPCError as e:
+            reason = e.__class__.__name__
+            if reason in _PERMISSION_ERRORS:        # no point retrying each file
+                return [], [(t, reason) for t in chunk]
+            break
+    done, failed = [], []
+    for t in chunk:
+        try:
+            await bot.delete_messages(chat, t["mid"])   # 0 = already gone, which is fine too
+            done.append(t)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            failed.append((t, "FloodWait"))
+        except RPCError as e:
+            failed.append((t, e.__class__.__name__))
+    return done, failed
+
+
+async def _run_delete(bot, status, tok: str, targets: list, action: str):
+    job = _del_jobs[tok] = {"cancel": False}
+    total = len(targets)
+    st = {"done": 0, "ch_ok": 0, "ch_fail": 0, "db_ok": 0, "db_missing": 0}
+    failed, reasons = [], {}
+    start, throttle = time.time(), Throttle(2.5)
+    stop_btn = Markup([[Btn("⛔ Stop", callback_data=f"dl#stop#{tok}")]])
+    title = "🗑 <b>Deleting…</b>"
+
+    async def show(force=False):
+        if not force and not throttle.ready():
+            return
+        d = st["done"]
+        elapsed = max(time.time() - start, 0.001)
+        eta = (total - d) / (d / elapsed) if d else 0
+        pct = int(100 * d / total) if total else 100
+        lines = [f"{title}\n", f"<code>{_bar(d, total)}</code> <b>{pct}%</b>  (<code>{d}</code> / <code>{total}</code>)\n"]
+        if action in ("both", "ch"):
+            lines.append(f"📢 Channel: ✅ <code>{st['ch_ok']}</code>  ❌ <code>{st['ch_fail']}</code>")
+        if action in ("both", "db"):
+            lines.append(f"🗄 Database: ✅ <code>{st['db_ok']}</code>")
+        lines.append(f"\n🕒 <code>{readable_time(elapsed)}</code>   ⏱ ETA <code>{readable_time(eta)}</code>")
+        await _safe_edit(status, "\n".join(lines), stop_btn)
+
+    async def remove_from_db(batch: list):
+        oids = [t["doc"]["_id"] for t in batch if t["doc"]]
+        st["db_missing"] += sum(1 for t in batch if not t["doc"])
+        if oids:
+            res = await files.delete_many({"_id": {"$in": oids}})
+            st["db_ok"] += res.deleted_count
+            st["db_missing"] += len(oids) - res.deleted_count
+
+    try:
+        await show(force=True)
+        channel_targets = [t for t in targets if t["chat"] is not None]
+        file_link_targets = [t for t in targets if t["chat"] is None]
+
+        if action == "db":
+            for i in range(0, total, 500):
+                if job["cancel"]:
+                    break
+                batch = targets[i:i + 500]
+                await remove_from_db(batch)
+                st["done"] += len(batch)
+                await show()
+        else:
+            by_chat: dict = {}
+            for t in channel_targets:
+                by_chat.setdefault(t["chat"], []).append(t)
+            for chat, group in by_chat.items():
+                for i in range(0, len(group), 100):
+                    if job["cancel"]:
+                        break
+                    chunk = group[i:i + 100]
+                    ok, bad = await _delete_channel_chunk(bot, chat, chunk)
+                    st["ch_ok"] += len(ok)
+                    st["ch_fail"] += len(bad)
+                    for t, why in bad:
+                        reasons[why] = reasons.get(why, 0) + 1
+                        failed.append((t["name"], why))
+                    if action == "both" and ok:
+                        await remove_from_db(ok)
+                    st["done"] += len(chunk)
+                    await show()
+                    await asyncio.sleep(0.3)
+            if action == "both" and not job["cancel"] and file_link_targets:
+                await remove_from_db(file_link_targets)       # database only — they have no channel message
+                st["done"] += len(file_link_targets)
+
+        stopped = job["cancel"]
+        if stopped:
+            title = "⛔ <b>Stopped</b>"
+        elif failed:
+            title = "⚠️ <b>Finished with errors</b>"
+        else:
+            title = "✅ <b>Delete finished</b>"
+        lines = [f"{title}\n", f"📦 Selected: <code>{total}</code>"]
+        if stopped:
+            lines.append(f"✔️ Processed before stopping: <code>{st['done']}</code>")
+        if action in ("both", "ch"):
+            lines.append(f"📢 Channel: ✅ <code>{st['ch_ok']}</code> deleted · ❌ <code>{st['ch_fail']}</code> failed")
+        if action in ("both", "db"):
+            line = f"🗄 Database: ✅ <code>{st['db_ok']}</code> deleted"
+            if st["db_missing"]:
+                line += f" · ⚠️ <code>{st['db_missing']}</code> not in database"
+            lines.append(line)
+        if action == "both" and st["ch_fail"]:
+            lines.append(f"⏸ Database records of the <code>{st['ch_fail']}</code> failed files were left untouched.")
+        if failed:
+            lines.append("\n<b>Failed:</b>")
+            lines += [f"• <code>{esc(n[:60])}</code> — {esc(w)}" for n, w in failed[:8]]
+            if len(failed) > 8:
+                lines.append(f"… and {len(failed) - 8} more")
+            if any(r in _PERMISSION_ERRORS for r in reasons):
+                lines.append("\n💡 Make the bot an admin of that channel with the <i>Delete messages</i> permission.")
+        await _safe_edit(status, "\n".join(lines))
+    except Exception:
+        logger.exception("/delete run crashed")
+        await _safe_edit(status, f"❌ Stopped by an internal error after <code>{st['done']}</code> / <code>{total}</code> files — see the logs.")
+    finally:
+        _del_jobs.pop(tok, None)
 
 
 @Client.on_callback_query(filters.regex(r"^dl#") & ADMIN)
 async def delete_callbacks(bot, query):
     _, action, tok = query.data.split("#")
+    if action == "stop":
+        job = _del_jobs.get(tok)
+        if job:
+            job["cancel"] = True
+            await query.answer("Stopping after the current batch…")
+        else:
+            await query.answer("Nothing is running.", show_alert=True)
+        return
     entry = _pending_del.get(tok)
     if action == "cancel":
         _pending_del.pop(tok, None)
         await query.message.edit_text("✖️ Cancelled — nothing was deleted.")
         return
-    if not entry:
+    if not entry or action not in ("db", "both", "ch"):
         await query.answer("Expired — send /delete again.", show_alert=True)
         return
     _pending_del.pop(tok, None)
-
-    doc = entry["doc"]
-    db_ok = ch_ok = None
-    errors = []
-
-    if action in ("both", "ch"):
-        try:
-            await bot.delete_messages(entry["chat_id"], entry["msg_id"])
-            ch_ok = True
-        except RPCError as e:
-            ch_ok = False
-            errors.append(f"Channel: {e.__class__.__name__} — does the bot have <i>delete messages</i> permission?")
-    if action in ("db", "both") and (action == "db" or ch_ok):
-        res = await files.delete_one({"_id": doc["_id"]} if doc else {"file_unique_id": entry["unique_id"]})
-        db_ok = res.deleted_count > 0
-
-    lines = ["<b>Result</b>\n"]
-    if db_ok is not None:
-        lines.append("🗄 Database: " + ("✅ deleted" if db_ok else "⚠️ not found"))
-    if ch_ok is not None:
-        lines.append("📢 Channel: " + ("✅ deleted" if ch_ok else "❌ failed"))
-    if action == "both" and not ch_ok:
-        lines.append("🗄 Database: ⏸ left untouched (channel delete failed)")
-    lines += [f"\n{e}" for e in errors]
     await query.answer()
-    await _safe_edit(query.message, "\n".join(lines))
+    asyncio.create_task(_run_delete(bot, query.message, tok, entry["targets"], action))
 
 
 @Client.on_message(filters.command("deleteall") & PRIVATE_ADMIN)
@@ -1795,7 +2129,7 @@ async def extra_help(_, message):
         "• /ban <code>user_id</code> · /unban <code>user_id</code> · /showban\n"
         "• /checklimit · /resetlimit <code>user_id</code> · /resetlimitall <i>(PM)</i>\n\n"
         "<b>🗄 Files</b>\n"
-        "• /delete <code>file_link</code> — delete one file (DB or DB + channel)\n"
+        "• /delete <code>link</code> · <code>link1, link2</code> · <code>start - end</code> — delete files (DB or DB + channel)\n"
         "• /deleteall — wipe all indexed files from MongoDB <i>(PM)</i>\n\n"
         "<b>🔗 Links &amp; support</b>\n"
         "• /link <code>name [year] [s01 e05]</code> — build a bot search link\n"

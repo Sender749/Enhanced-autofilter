@@ -22,7 +22,9 @@ async def start(bot):
         return
     from webapp.catalog import ensure_indexes, background_loop
     await ensure_indexes()
+    from webapp.api import warm_loop
     _task = asyncio.create_task(background_loop(WEBAPP_SYNC_SECONDS))
+    asyncio.create_task(warm_loop())  # keeps the home page cached so the app opens instantly
     if not WEBAPP_URL:
         logger.warning("Web app is ON but WEBAPP_URL / STREAM_BASE_URL isn't set — the Open button is disabled.")
         return

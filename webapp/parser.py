@@ -29,7 +29,7 @@ P_STOP = re.compile(
     r"[\(\[]|\b(19[2-9]\d|20[0-3]\d)\b|\b\d{3,4}p\b|\b(x26[45]|hevc|h\.?26[45]|web[- ]?dl|web[- ]?rip|"
     r"hd[- ]?rip|blu[- ]?ray|bdrip|hdts|hdtc|hdcam|dvdrip|nf|amzn|dual|multi|hindi|english|tamil|telugu|"
     r"korean|japanese|punjabi|chinese|bengali|marathi|malayalam|kannada|thai|turkish|spanish|german|french|"
-    r"web series|uncut|unrated|esubs?|msubs?)\b", re.I)
+    r"web series|uncut|unrated|dubbed|subbed|esubs?|msubs?)\b", re.I)
 LANGS = ["hindi","english","tamil","telugu","korean","japanese","punjabi","chinese","bengali","marathi",
          "malayalam","kannada","thai","turkish","spanish","german","french","urdu"]
 
@@ -133,9 +133,14 @@ def parse(raw):
     if m2 and m2.start() > 0:
         cut = tt[:m2.start()]
     elif m2 and m2.start() == 0:
-        rest = tt[m2.end():]
-        m3 = P_STOP.search(rest)
-        cut = tt
+        rest = tt
+        while True:  # leading language/quality words ("Hindi Dubbed South Movie 2025"): drop them, then cut
+            m3 = P_STOP.match(rest)
+            if not m3 or m3.end() == 0:
+                break
+            rest = rest[m3.end():].lstrip(" -.:~")
+        m4 = P_STOP.search(rest)
+        cut = rest[:m4.start()] if m4 and m4.start() > 0 else rest
     title = re.sub(r"\s+", " ", cut).strip(" -•:~.[]()")
     title = re.sub(r"^(S\d+\s*)+", "", title).strip(" -•:~.")
     r["title"] = title
@@ -144,7 +149,11 @@ def parse(raw):
     qm = P_Q.search(t)
     r["quality"] = qm.group(1) + "p" if qm else None
     low = t.lower()
+    alt = "|".join(LANGS)
+    low = re.sub(r"\b(%s)\s*(e?subs?|subtitles?)\b" % alt, " ", low)          # "English Subs"
+    low = re.sub(r"\b(e?subs?|subtitles?)\s*[:\-\[\(]?\s*(%s)\b" % alt, " ", low)  # "ESub English"
     r["langs"] = [l for l in LANGS if re.search(r"\b" + l + r"\b", low)]
+    r["rank"] = print_rank(t)
     r["is_series"] = bool(r["season"] or r["ep_from"] or r["pack"] or re.search(r"web series", t, re.I) or r["seasons"])
     r["anime"] = bool(re.search(r"\banime\b", t, re.I))
     if not title:
@@ -177,3 +186,26 @@ def category(r):
 def key(r):
     k = re.sub(r"[^a-z0-9]", "", re.sub(r"^the\s+", "", r["title"].lower()))
     return k if r["is_series"] else k + (r["year"] or "")
+
+
+# ── print quality ───────────────────────────────────────────────────────────
+_RANKS = [
+    (re.compile(r"\b(cam|hd[- ]?cam|cam[- ]?rip|hd[- ]?ts|telesync|\bts\b|hd[- ]?tc|telecine|pre[- ]?dvd|dvd[- ]?scr|scr(eener)?|hq[- ]?cam|line audio)\b", re.I), 10),
+    (re.compile(r"\b(remux|blu[- ]?ray|bd[- ]?rip|br[- ]?rip|bdremux)\b", re.I), 100),
+    (re.compile(r"\b(web[- ]?dl|amzn|nf|dsnp|hmax|atvp|zee5|jc|sony ?liv|hotstar|hs|aha)\b", re.I), 95),
+    (re.compile(r"\bweb[- ]?rip\b", re.I), 85),
+    (re.compile(r"\b(hd[- ]?rip|dvd[- ]?rip|hdtv|tv[- ]?rip)\b", re.I), 70),
+]
+
+
+def print_rank(text: str) -> int:
+    """How good a print this caption describes: BluRay / WEB-DL highest, CAM / HDTS lowest."""
+    text = text or ""
+    for rx, score in _RANKS[:1]:
+        if rx.search(text):
+            return score
+    best = 0
+    for rx, score in _RANKS[1:]:
+        if rx.search(text):
+            best = max(best, score)
+    return best or 50

@@ -97,11 +97,14 @@ async def _refresh_titles(tkeys: list):
         await titles.bulk_write(ops, ordered=False)
 
 
-async def sync(full: bool = False, batch: int = 1000) -> int:
-    """Parse files newer than the last sync. Returns files processed."""
+async def sync(full: bool = False, batch: int = 1000, rematch: bool = False) -> int:
+    """Parse files newer than the last sync. Returns files processed.
+    full=True re-parses everything; rematch=True also re-checks every poster/metadata match."""
     if _sync_lock.locked():
         return 0
     async with _sync_lock:
+        if rematch:
+            await titles.update_many({}, {"$set": {"rematch": True}})
         st = await state.find_one({"_id": "sync"}) or {}
         last = 0.0 if full else float(st.get("last_ts") or 0.0)
         cursor = files.find({"indexed_at": {"$gt": last}}, {
@@ -167,6 +170,13 @@ async def _tmdb_match(session: aiohttp.ClientSession, name: str, year: str | Non
             score -= 12
         if year and date.startswith(str(year)):
             score += 8
+        cy = int(date[:4]) if date[:4].isdigit() else None
+        if year and str(year).isdigit() and cy:  # reject remakes / same-name titles from the wrong year
+            y = int(year)
+            if want == "movie" and abs(cy - y) > 1:
+                score -= 30
+            elif want == "tv" and cy > y + 1:
+                score -= 30
         if score > best_score:
             best, best_score = x, score
     if not best or best_score < 80 or not (best.get("poster_path") or best.get("backdrop_path")):
@@ -174,46 +184,61 @@ async def _tmdb_match(session: aiohttp.ClientSession, name: str, year: str | Non
     return best
 
 
-async def enrich_once(limit: int = 25) -> int:
-    cur = titles.find({"meta_status": "pending"}, {"name": 1, "year": 1, "kind": 1}).sort("last_indexed_at", DESCENDING).limit(limit)
+async def _enrich_one(session, t: dict):
+    try:
+        m = await _tmdb_match(session, t["name"], t.get("year"), t.get("kind", "movie"))
+    except Exception:
+        logger.warning("TMDB lookup failed for %r", t["name"], exc_info=True)
+        return False
+    if m == "error":
+        return False
+    if m is None:
+        await titles.update_one({"_id": t["_id"]}, {"$set": {
+            "meta_status": "none", "meta_at": time.time(), "rematch": False,
+            "poster": None, "backdrop": None, "overview": None, "rating": None}})
+        return True
+    date = m.get("release_date") or m.get("first_air_date") or ""
+    try:
+        release_ts = time.mktime(time.strptime(date, "%Y-%m-%d"))
+    except Exception:
+        release_ts = None
+    is_tv = m.get("media_type") == "tv"
+    if is_tv and t.get("year"):
+        # A series' TMDB date is its first season; the caption year tracks the newest season/episodes.
+        ys = _year_ts(t["year"])
+        if ys and (release_ts is None or ys > release_ts):
+            release_ts = ys
+    genres = [_GENRES[g] for g in (m.get("genre_ids") or []) if g in _GENRES][:3]
+    upd = {
+        "meta_status": "ok", "meta_at": time.time(), "rematch": False, "tmdb_id": m.get("id"),
+        "poster": m.get("poster_path"), "backdrop": m.get("backdrop_path"),
+        "overview": (m.get("overview") or "")[:600], "rating": round(m.get("vote_average") or 0, 1),
+        "genres": genres, "release_date": date or None,
+        "display_name": m.get("title") or m.get("name") or t["name"],
+    }
+    if release_ts:
+        upd["release_ts"] = release_ts
+    if is_tv and 16 in (m.get("genre_ids") or []) and m.get("original_language") == "ja":
+        upd["kind"] = "anime"
+        upd["anime_meta"] = True
+    await titles.update_one({"_id": t["_id"]}, {"$set": upd})
+    return True
+
+
+async def enrich_once(limit: int = 40, parallel: int = 8) -> int:
+    """Look up posters for pending titles, `parallel` at a time (TMDB allows far more)."""
+    cur = titles.find({"$or": [{"meta_status": "pending"}, {"rematch": True}]}, {"name": 1, "year": 1, "kind": 1}) \
+        .sort("last_indexed_at", DESCENDING).limit(limit)
     todo = [t async for t in cur]
     if not todo:
         return 0
+    failed = 0
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        for t in todo:
-            try:
-                m = await _tmdb_match(session, t["name"], t.get("year"), t.get("kind", "movie"))
-            except Exception:
-                logger.warning("TMDB lookup failed for %r", t["name"], exc_info=True)
-                await asyncio.sleep(2)
-                continue
-            if m == "error":
-                await asyncio.sleep(5)
-                continue
-            if m is None:
-                await titles.update_one({"_id": t["_id"]}, {"$set": {"meta_status": "none", "meta_at": time.time()}})
-            else:
-                date = m.get("release_date") or m.get("first_air_date") or ""
-                try:
-                    release_ts = time.mktime(time.strptime(date, "%Y-%m-%d"))
-                except Exception:
-                    release_ts = None
-                genres = [_GENRES[g] for g in (m.get("genre_ids") or []) if g in _GENRES][:3]
-                upd = {
-                    "meta_status": "ok", "meta_at": time.time(), "tmdb_id": m.get("id"),
-                    "poster": m.get("poster_path"), "backdrop": m.get("backdrop_path"),
-                    "overview": (m.get("overview") or "")[:600], "rating": round(m.get("vote_average") or 0, 1),
-                    "genres": genres, "release_date": date or None,
-                    "display_name": m.get("title") or m.get("name") or t["name"],
-                }
-                if release_ts:
-                    upd["release_ts"] = release_ts
-                if m.get("media_type") == "tv" and 16 in (m.get("genre_ids") or []) and m.get("original_language") == "ja":
-                    upd["kind"] = "anime"
-                    upd["anime_meta"] = True
-                await titles.update_one({"_id": t["_id"]}, {"$set": upd})
-            await asyncio.sleep(0.3)
-    return len(todo)
+        for i in range(0, len(todo), parallel):
+            res = await asyncio.gather(*(_enrich_one(session, t) for t in todo[i:i + parallel]))
+            failed += res.count(False)
+            await asyncio.sleep(0.3 if not failed else 3)
+    return len(todo) if failed < len(todo) else 0
 
 
 async def background_loop(interval: int):

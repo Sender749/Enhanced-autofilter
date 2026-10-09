@@ -37,7 +37,6 @@ USER_COMMANDS = [
     BotCommand("trending", "Most searched titles"),
     BotCommand("myplan", "Check your premium status"),
     BotCommand("req", "Request a file"),
-    BotCommand("app", "Open the movie app"),
 ]
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("admin", "Admin commands panel"),
@@ -84,12 +83,6 @@ class Bot(Client):
         logger.info("Bot started as @%s (ID: %s)", me.username, me.id)
 
         await self._setup_commands()
-
-        try:
-            import webapp
-            await webapp.start(self)
-        except Exception:
-            logger.exception("Web app failed to start — the bot continues without it")
 
         if FASTDL_SERVER_ENABLED:
             # Second session of the main token + any helper bots, download-only.

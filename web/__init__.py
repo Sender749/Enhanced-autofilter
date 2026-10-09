@@ -14,3 +14,7 @@ web_app.add_routes([web.get("/", _health)])
 if FASTDL_SERVER_ENABLED:
     from fastdl.server import register_routes
     register_routes(web_app)
+
+# Web app (Mini App pages + JSON API) — see webapp/.
+import webapp
+webapp.register_routes(web_app)

@@ -32,12 +32,12 @@ async def status_cmd(_, message):
 
 @Client.on_message(filters.command("webapp_sync") & filters.user(ADMINS))
 async def sync_cmd(_, message):
-    """/webapp_sync = pick up new files now; /webapp_sync full = re-parse everything."""
+    """/webapp_sync = pick up new files now; /webapp_sync full = re-parse every file AND re-check every poster match."""
     from webapp.catalog import sync
     full = "full" in message.text.lower()
     note = await message.reply_text("⏳ Re-parsing every file…" if full else "⏳ Syncing new files…")
 
     async def run():
-        n = await sync(full=full)
+        n = await sync(full=full, rematch=full)
         await note.edit_text(f"✅ Catalog sync done: <code>{n}</code> files processed.")
     asyncio.create_task(run())

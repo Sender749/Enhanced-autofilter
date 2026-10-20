@@ -456,7 +456,7 @@ _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?>")
 _JUNK_RE = re.compile(
     r"\b(s\d{1,2}e?\d{0,3}|season\s*\d+|ep(?:isode)?\.?\s*\d+|\d{3,4}p|4k|uhd|hdr\d*|"
     r"bluray|bdrip|remux|web-?dl|webrip|hdrip|dvdrip|hdtv|cam|hdts|ts|"
-    r"hevc|x264|x265|avc|av1|aac|ddp\d?\.?\d?|dts|flac|mp3|ac3|"
+    r"hevc|x264|x265|avc|av1|aac|ddp\d?\.?\d?|dts|flac|mp3|ac3|mp4|mkv|avi|mov|webm|m4v|m2ts|"
     r"esubs?|subs?|subbed|dubbed|dual\s*audio|multi\s*audio|dual|multi|"
     + "|".join(pat for _code, pat, _tokens in _SOURCE_RULES) + "|"
     + "|".join(re.escape(a) for aliases in _LANGUAGE_ALIASES.values() for a in aliases)
@@ -477,6 +477,14 @@ _LEADING_TAG_RE = re.compile(r"^\s*\[[^\]\n]{1,40}\]\s*")
 # "720p • Jawan 2023" — a quality tag in front of the title.
 _LEADING_RES_RE = re.compile(r"^[\W_]*(?:\d{3,4}p|4k|uhd)\b[\W_]*", re.IGNORECASE)
 _HAS_LETTER_RE = re.compile(r"[^\W\d_]{2,}")  # a real word (2+ letters), not the "p" of 720p
+# "Action Movie  Rifle Ganj | Om Puri, ..." — a genre/language label plus the
+# word Movie/Film in front of the title. Only the label+Movie pair is removed,
+# never a bare "Crime" or "Family" (Crime Patrol, Family Guy are real titles).
+_LEADING_LABEL_RE = re.compile(
+    r"^\s*(?:action|drama|comedy|romantic|romance|thriller|horror|crime|family|adventure|"
+    r"animation|animated|sci[\s-]?fi|south|bollywood|hollywood|punjabi|hindi|tamil|telugu|"
+    r"malayalam|kannada|bhojpuri|bengali|marathi)\s+(?:movies?|films?)\s+", re.IGNORECASE,
+)
 
 
 def clean_title(text: str) -> str:
@@ -485,6 +493,12 @@ def clean_title(text: str) -> str:
     # strip that first, or a formatted caption's title never matches an
     # unformatted query, which used to make Stage 1 miss almost everything.
     t = _HTML_TAG_RE.sub(" ", text)
+    # "Title | cast, cast, cast": everything after a pipe is description. Done
+    # before clean_display_text, which would turn the pipe into a plain space.
+    if "|" in t:
+        left = t.split("|", 1)[0]
+        if _HAS_LETTER_RE.search(left):
+            t = left
     t = clean_display_text(t)
     # Underscore-separated file names ("Avengers_Infinity_War_2018_BluRay…"):
     # "_" counts as a word character, so without this no year / quality tag in
@@ -499,6 +513,9 @@ def clean_title(text: str) -> str:
         stripped = _LEADING_RES_RE.sub("", t, count=1)
         if stripped == t or not _HAS_LETTER_RE.search(stripped):
             break
+        t = stripped
+    stripped = _LEADING_LABEL_RE.sub("", t, count=1)
+    if _HAS_LETTER_RE.search(stripped):
         t = stripped
 
     # A title can legitimately START with a language/tag word ("Hindi Medium",
@@ -548,7 +565,7 @@ def clean_title(text: str) -> str:
 # Bump this whenever the rules that build a title key change (clean_title /
 # title_key). Files stored with an older number are re-keyed automatically by
 # the startup backfill, so a rule change never leaves old files behind.
-KEY_VERSION = 2
+KEY_VERSION = 3
 _KEY_STOPWORDS = frozenset()  # articles (the/a/an) are NOT dropped: "The Flash" and "Flash" are different titles
 _KEY_WORD_RE = re.compile(r"[^\W_]+")
 _KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")
@@ -873,52 +890,71 @@ async def _search_by_tags(query: str) -> list:
 
 async def related_titles(query: str, limit: int = 8) -> list:
     """
-    Titles in the database that START WITH the query — used only when there is
-    no exact match, so "pushpa" can offer "Pushpa The Rise" and "dune" can
-    offer "Dune Part Two". Returns clean display titles, most files first.
-
+    Titles in the database related to a query that has no exact match. Used
+    only after the normal search failed, to offer buttons:
+      * titles that START with the query   ("pushpa" -> "Pushpa The Rise")
+      * titles that CONTAIN it as whole words, shown after those
+                                            ("rifle ganj" -> "Chhota Rifle Ganj Part 2")
     Matching is on whole words ("jawan" never offers "Jawani ..."), ignores
     spacing/symbols like the normal search ("spiderman" offers "Spider Man No
-    Way Home"), and only returns titles that are LONGER than the query — an
-    equal title would already have been found by the normal search.
+    Way Home"), and only returns titles LONGER than the query. The "contains"
+    kind is only used for queries of 2+ words or 5+ letters, so a short word
+    like "you" can't pull in half the database. Returns clean display titles.
     """
     title = parse_query(query)[0]
     qkeys = title_key_variants(title)
     if not qkeys or min(len(k) for k in qkeys) < 2:
         return []
 
-    # tkeys is indexed, and an anchored prefix regex can use that index.
+    docs = {}
+    # Starts-with candidates: tkeys is indexed, an anchored prefix regex uses it.
     cond = [{"tkeys": {"$regex": "^" + re.escape(k)}} for k in qkeys]
     cursor = files.find({"$or": cond}, {"file_name": 1, "caption": 1}).limit(_CANDIDATE_FETCH)
-    docs = await cursor.to_list(length=_CANDIDATE_FETCH)
+    for doc in await cursor.to_list(length=_CANDIDATE_FETCH):
+        docs[doc["_id"]] = doc
+
+    # Contains candidates: the word index narrows it; whole-word position is
+    # verified below.
+    qwords = _tokenize(clean_title(title))
+    if qwords and (len(qwords) >= 2 or min(len(k) for k in qkeys) >= 5):
+        cursor = files.find({"words": {"$all": qwords}}, {"file_name": 1, "caption": 1}).limit(_CANDIDATE_FETCH)
+        for doc in await cursor.to_list(length=_CANDIDATE_FETCH):
+            docs.setdefault(doc["_id"], doc)
 
     longest = max(len(k) for k in qkeys)
-    groups: dict = {}  # normalised title -> {"count": n, "shown": {display: n}}
-    for doc in docs:
+    allow_contains = bool(qwords) and (len(qwords) >= 2 or min(len(k) for k in qkeys) >= 5)
+    groups: dict = {}  # normalised title -> {"count", "shown", "contains"}
+    for doc in docs.values():
         seen = set()
         for src in {display_name(doc), doc.get("file_name", "") or ""}:
             shown = clean_title(src)
             tokens = _KEY_WORD_RE.findall(_KEY_APOSTROPHE_RE.sub("", shown).lower())
-            acc = ""
-            for i, tok in enumerate(tokens):
-                acc += tok
-                if acc in qkeys:
-                    if i + 1 < len(tokens):  # strictly longer than the query
-                        norm = " ".join(tokens)
-                        if norm not in seen:
-                            seen.add(norm)
-                            g = groups.setdefault(norm, {"count": 0, "shown": {}})
-                            g["count"] += 1
-                            g["shown"][shown] = g["shown"].get(shown, 0) + 1
+            hit = None  # (start index, end index) of the query inside the title
+            for start in range(len(tokens)):
+                if start > 0 and not allow_contains:
                     break
-                if len(acc) >= longest:
+                acc = ""
+                for end in range(start, len(tokens)):
+                    acc += tokens[end]
+                    if acc in qkeys:
+                        hit = (start, end)
+                        break
+                    if len(acc) >= longest:
+                        break
+                if hit:
                     break
+            if not hit or (hit[0] == 0 and hit[1] == len(tokens) - 1):
+                continue  # no match, or the title IS the query (normal search's job)
+            norm = " ".join(tokens)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            g = groups.setdefault(norm, {"count": 0, "shown": {}, "contains": hit[0] > 0})
+            g["count"] += 1
+            g["shown"][shown] = g["shown"].get(shown, 0) + 1
 
-    ranked = sorted(groups.items(), key=lambda kv: (-kv[1]["count"], len(kv[0])))
-    out = []
-    for _norm, g in ranked[:limit]:
-        out.append(max(g["shown"].items(), key=lambda kv: kv[1])[0])
-    return out
+    ranked = sorted(groups.items(), key=lambda kv: (kv[1]["contains"], -kv[1]["count"], len(kv[0])))
+    return [max(g["shown"].items(), key=lambda kv: kv[1])[0] for _norm, g in ranked[:limit]]
 
 
 async def search_files(query: str, use_alias: bool = True) -> list:
@@ -990,6 +1026,58 @@ async def search_files(query: str, use_alias: bool = True) -> list:
 
     results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
     return results[:_MAX_FETCH]
+
+
+async def relaxed_search(query: str) -> dict | None:
+    """
+    For a query whose TITLE exists but whose extra tag (season / episode / year
+    / language / quality) matches no file — "loki s05", "jawan 2024". Called
+    only after search_files() came back empty.
+
+    Returns None when the title itself isn't found (so the normal fuzzy /
+    suggestion stages carry on). Otherwise:
+      title    clean display title of the matched files
+      all      every file of that title
+      results  the files that still fit the tags which DO exist (or all of
+               them if no combination fits)
+      dropped  names of the requested tags nothing matched ("season", "year"…)
+      tags     the tags the user asked for
+      meta     extract_meta(all) — available seasons / years / languages…
+    """
+    query = query.strip()
+    if not query or parse_tag_only_query(query) is not None:
+        return None
+    title, tags = parse_query(query)
+    active = {k: v for k, v in tags.items() if v is not None}
+    if not active:
+        return None
+
+    everything = await search_files(title)  # title only: no tag filtering
+    if not everything:
+        return None
+
+    kept, dropped = {}, []
+    for name, value in active.items():
+        probe = {name: value}
+        if name == "episode" and active.get("season") is not None:
+            probe["season"] = active["season"]  # "episode 9" only counts inside that season
+        if apply_filters(everything, probe):
+            kept[name] = value
+        else:
+            dropped.append(name)
+
+    partial = apply_filters(everything, kept) if kept else everything
+    if not partial:  # each tag exists alone, but never together
+        dropped, partial = list(active), everything
+
+    return {
+        "title": clean_title(display_name(everything[0])) or title,
+        "all": everything,
+        "results": partial,
+        "dropped": dropped,
+        "tags": active,
+        "meta": extract_meta(everything),
+    }
 
 
 async def get_file_by_id(object_id: str) -> dict | None:

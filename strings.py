@@ -36,6 +36,11 @@ STATUS_STAGE3_TXT = "🤖 Asking AI..."
 
 # ── Stage 3 suggestion buttons (shown when nothing auto-resolves) ──────────
 SUGGESTIONS_HEADER_TXT = "🤔 Couldn't find an exact match for <b>{query}</b>. Did you mean:"
+SEASON_MENU_TXT = "❌ <b>{title}</b> — <b>{missing}</b> isn't available (yet).\n\nAvailable seasons: <b>{seasons}</b>\nPick a season:"
+SEASON_BTN = "Season {n}"
+SEASON_ALL_BTN = "📂 All seasons"
+RELAXED_NOTE_TXT = "⚠️ <b>{missing}</b> isn't available — {scope}."
+RELAXED_AVAILABLE_TXT = "\n📌 {label}: <b>{values}</b>"
 RELATED_HEADER_TXT = "🔎 No exact match for <b>{query}</b>, but these related titles are in the database:"
 SUGGESTION_NOT_FOUND_TXT = "❌ <b>{title}</b> isn't in the database yet."
 

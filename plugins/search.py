@@ -14,7 +14,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK
 from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
-    related_titles,
+    related_titles, relaxed_search,
 )
 from database.alias_db import alias_key, create_miss, set_miss_message
 from database.settings_db import get_settings
@@ -30,6 +30,7 @@ from strings import (
     FILTER_CLEAR_BTN, HOME_BTN, NO_MATCH_TXT,
     STATUS_STAGE1_TXT, STATUS_STAGE2_TXT, STATUS_STAGE3_TXT,
     SUGGESTIONS_HEADER_TXT, SUGGESTION_NOT_FOUND_TXT, RELATED_HEADER_TXT,
+    SEASON_MENU_TXT, SEASON_BTN, SEASON_ALL_BTN, RELAXED_NOTE_TXT, RELAXED_AVAILABLE_TXT,
     REQUEST_BTN_TXT, REQUEST_NOT_CONFIGURED_TXT, REQUEST_SENT_TXT,
     MAINTENANCE_TXT, EMPTY_QUERY_TXT,
     PM_SEARCH_OFF_TXT, PM_SEARCH_OFF_BTN,
@@ -103,13 +104,15 @@ def _cache_get(key: str) -> dict | None:
     return entry
 
 
-def _cache_put(key: str, query: str, results: list, mode: str, poster, original_query: str | None = None) -> dict:
+def _cache_put(key: str, query: str, results: list, mode: str, poster, original_query: str | None = None,
+               note: str | None = None) -> dict:
     if len(_CACHE) >= _CACHE_MAX_ENTRIES:
         oldest = min(_CACHE, key=lambda k: _CACHE[k]["time"])
         _CACHE.pop(oldest, None)
     entry = {
         "query": query,
         "original_query": original_query,  # set only when a typo-correction was used
+        "note": note,  # one extra line under the header (e.g. "Season 5 isn't available")
         "results": results,
         "mode": mode,
         "meta": extract_meta(results),
@@ -317,6 +320,9 @@ def _render(key: str, entry: dict, offset: int):
         else RESULT_HEADER_TXT.format(query=html.escape(entry["query"]), total=total)
     )
 
+    if entry.get("note"):
+        header += "\n" + entry["note"]
+
     rows = _filter_rows(key, entry["meta"], entry["filters"], offset)
 
     if total == 0:
@@ -447,7 +453,7 @@ async def _status_update(message, text: str, markup=None):
 
 
 async def _deliver_results(message, resolved_query: str, results: list,
-                            original_query: str | None = None):
+                            original_query: str | None = None, note: str | None = None):
     """Send the poster (if found) + the results/filter message — the exact
     same flow whether Stage 1 found it directly or the user just clicked a
     Stage-3 suggestion button. The poster always comes from the result
@@ -458,7 +464,7 @@ async def _deliver_results(message, resolved_query: str, results: list,
     settings = await get_settings()
     mode = settings["result_mode"]
     key = _cache_key(resolved_query)
-    entry = _cache_put(key, resolved_query, results, mode, poster, original_query)
+    entry = _cache_put(key, resolved_query, results, mode, poster, original_query, note)
 
     text, markup = _render(key, entry, offset=0)
     if settings["query_autodelete_enabled"]:
@@ -482,6 +488,120 @@ async def _deliver_results(message, resolved_query: str, results: list,
     if settings["query_autodelete_enabled"]:
         for m in to_delete:
             asyncio.create_task(_schedule_delete(m, settings["query_autodelete_seconds"]))
+
+
+# ── "Title exists, but not that season / year / language / quality" ─────────
+# "loki s05" or "jawan 2024": the title is in the database, only the extra tag
+# matches nothing. Instead of "no results" the bot says which tag is missing and
+# shows what exists — a season menu for series, a note + all files otherwise.
+_RELAX_CACHE: dict = {}
+
+
+def _relax_cache_put(key: str, title: str, results: list):
+    if len(_RELAX_CACHE) >= _CACHE_MAX_ENTRIES:
+        oldest = min(_RELAX_CACHE, key=lambda k: _RELAX_CACHE[k]["time"])
+        _RELAX_CACHE.pop(oldest, None)
+    _RELAX_CACHE[key] = {"title": title, "all": results, "time": time.time()}
+
+
+def _relax_cache_get(key: str) -> dict | None:
+    entry = _RELAX_CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["time"] > _CACHE_TTL:
+        _RELAX_CACHE.pop(key, None)
+        return None
+    return entry
+
+
+def _fmt_tag(name: str, value) -> str:
+    if name == "season":
+        return f"Season {int(value)}"
+    if name == "episode":
+        return f"Episode {int(value)}"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def _tags_label(tags: dict) -> str:
+    return " ".join(_fmt_tag(k, v) for k, v in tags.items())
+
+
+def _relaxed_note(relaxed: dict) -> str:
+    """'⚠️ 2024 isn't available — showing all files.\n📅 Available: 2023'"""
+    tags, dropped, meta = relaxed["tags"], relaxed["dropped"], relaxed["meta"]
+    missing = ", ".join(_fmt_tag(k, tags[k]) for k in dropped)
+    kept = {k: v for k, v in tags.items() if k not in dropped}
+    scope = f"showing {_tags_label(kept)} files" if kept else "showing all files"
+    note = RELAXED_NOTE_TXT.format(missing=html.escape(missing), scope=html.escape(scope))
+    lines = []
+    if "season" in dropped and meta["seasons"]:
+        lines.append(("Seasons", ", ".join(str(n) for n in meta["seasons"])))
+    if "episode" in dropped:
+        eps = extract_meta(relaxed["results"])["episodes"]
+        if eps:
+            lines.append(("Episodes", ", ".join(str(n) for n in eps)))
+    if "year" in dropped and meta["years"]:
+        lines.append(("Years", ", ".join(meta["years"])))
+    if "language" in dropped and meta["languages"]:
+        lines.append(("Languages", ", ".join(meta["languages"])))
+    if ({"quality", "resolution", "source"} & set(dropped)) and meta["qualities"]:
+        lines.append(("Qualities", ", ".join(label for _code, label in meta["qualities"])))
+    for label, values in lines:
+        note += RELAXED_AVAILABLE_TXT.format(label=label, values=html.escape(values))
+    return note
+
+
+async def _deliver_relaxed(message, status, query: str, relaxed: dict, settings: dict):
+    title, dropped, meta = relaxed["title"], relaxed["dropped"], relaxed["meta"]
+
+    # Series where the requested SEASON doesn't exist: a menu of the seasons
+    # that do (tap one to open it).
+    if "season" in dropped and meta["seasons"]:
+        key = _cache_key("seasons:" + title + ":" + query)
+        _relax_cache_put(key, title, relaxed["all"])
+        buttons = [InlineKeyboardButton(SEASON_BTN.format(n=n), callback_data=f"sfb#{key}#{n}")
+                   for n in meta["seasons"]]
+        rows = _chunk(buttons, 3)
+        rows.append([InlineKeyboardButton(SEASON_ALL_BTN, callback_data=f"sfb#{key}#0")])
+        text = SEASON_MENU_TXT.format(
+            title=html.escape(title),
+            missing=html.escape(_fmt_tag("season", relaxed["tags"]["season"])),
+            seasons=", ".join(str(n) for n in meta["seasons"]),
+        )
+        if settings["query_autodelete_enabled"]:
+            text += QUERY_AUTODELETE_NOTE.format(duration=format_duration(settings["query_autodelete_seconds"]))
+        status = await _status_update(status, text, InlineKeyboardMarkup(rows))
+        if settings["query_autodelete_enabled"]:
+            asyncio.create_task(_schedule_delete(status, settings["query_autodelete_seconds"]))
+        return
+
+    # Everything else (movie year, language, quality, a missing episode…):
+    # the normal results page for what DOES exist, with a note on top.
+    kept = {k: v for k, v in relaxed["tags"].items() if k not in dropped}
+    resolved = f"{title} {_tags_label(kept)}".strip()
+    await _deliver_results(message, resolved, relaxed["results"], note=_relaxed_note(relaxed))
+    asyncio.create_task(record_search(title_of(relaxed["results"], title)))
+    asyncio.create_task(_schedule_delete(status, 0))
+
+
+@Client.on_callback_query(filters.regex(r"^sfb#"))
+async def season_fallback_clicked(_, query):
+    _, key, n = query.data.split("#")
+    await query.answer()
+    entry = _relax_cache_get(key)
+    if not entry:
+        await _expired(query.message)
+        return
+    season = int(n)
+    results = entry["all"] if season == 0 else apply_filters(entry["all"], {"season": season})
+    if not results:
+        await _expired(query.message)
+        return
+    resolved = entry["title"] if season == 0 else f"{entry['title']} Season {season}"
+    await _deliver_results(query.message, resolved, results)
+    asyncio.create_task(_schedule_delete(query.message, 0))
 
 
 @Client.on_message(search_filter)
@@ -536,6 +656,14 @@ async def handle_search(bot, message):
             asyncio.create_task(record_search(title_of(results, query)))
         asyncio.create_task(_schedule_delete(status, 0))
         return
+
+    # The title exists but the extra tag (season / year / language / quality)
+    # matches nothing — show what DOES exist instead of "no results".
+    if not lang_year_only:
+        relaxed = await relaxed_search(query)
+        if relaxed:
+            await _deliver_relaxed(message, status, query, relaxed, settings)
+            return
 
     # Stage 2 — fuzzy match against your own DB's titles. Free, in-memory,
     # a few milliseconds. Catches ordinary typos without ever cross-

@@ -477,6 +477,22 @@ _LEADING_TAG_RE = re.compile(r"^\s*\[[^\]\n]{1,40}\]\s*")
 # "720p • Jawan 2023" — a quality tag in front of the title.
 _LEADING_RES_RE = re.compile(r"^[\W_]*(?:\d{3,4}p|4k|uhd)\b[\W_]*", re.IGNORECASE)
 _HAS_LETTER_RE = re.compile(r"[^\W\d_]{2,}")  # a real word (2+ letters), not the "p" of 720p
+
+# Words an admin approved as "not part of the title" (uploader / channel names
+# such as "ToonWorld4All" at the front of captions). Loaded from the database at
+# start-up and changed from the AI-learning review messages; only ever removed
+# from the START of a title, and never when nothing else would be left.
+_NOISE_WORDS: frozenset = frozenset()
+_LEADING_WORD_RE = re.compile(r"^[\W_]*(\w+)")
+
+
+def set_noise_words(words) -> None:
+    global _NOISE_WORDS
+    _NOISE_WORDS = frozenset(w.lower() for w in words if w)
+
+
+def get_noise_words() -> frozenset:
+    return _NOISE_WORDS
 # "Action Movie  Rifle Ganj | Om Puri, ..." — a genre/language label plus the
 # word Movie/Film in front of the title. Only the label+Movie pair is removed,
 # never a bare "Crime" or "Family" (Crime Patrol, Family Guy are real titles).
@@ -517,6 +533,15 @@ def clean_title(text: str) -> str:
     stripped = _LEADING_LABEL_RE.sub("", t, count=1)
     if _HAS_LETTER_RE.search(stripped):
         t = stripped
+    if _NOISE_WORDS:
+        for _ in range(4):
+            m = _LEADING_WORD_RE.match(t)
+            if not m or m.group(1).lower() not in _NOISE_WORDS:
+                break
+            rest = t[m.end():]
+            if not _HAS_LETTER_RE.search(rest):
+                break
+            t = rest
 
     # A title can legitimately START with a language/tag word ("Hindi Medium",
     # "English Vinglish", "Sub Zero"). Keep the first word untouched and only
@@ -886,6 +911,27 @@ async def _search_by_tags(query: str) -> list:
 
     results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
     return results[:_MAX_FETCH]
+
+
+async def rekey_docs_with_word(word: str, batch_size: int = 500) -> int:
+    """Recompute the search keys of every file whose name/caption contains
+    `word` — run after an admin adds/removes a noise word, so existing files
+    follow the new rule immediately instead of waiting for a full rebuild."""
+    from pymongo import UpdateOne
+
+    updated, batch = 0, []
+    async for doc in files.find({"words": word.lower()}, {"file_name": 1, "caption": 1}):
+        tkeys = doc_title_keys(doc.get("file_name", "") or "", doc.get("caption", "") or "")
+        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"tkeys": tkeys, "tkv": KEY_VERSION}}))
+        if len(batch) >= batch_size:
+            await files.bulk_write(batch, ordered=False)
+            updated += len(batch)
+            batch = []
+            await asyncio.sleep(0.05)
+    if batch:
+        await files.bulk_write(batch, ordered=False)
+        updated += len(batch)
+    return updated
 
 
 async def related_titles(query: str, limit: int = 8) -> list:

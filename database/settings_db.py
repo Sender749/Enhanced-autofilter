@@ -57,6 +57,17 @@ DEFAULTS = {
     "pm_filter_enabled": ENABLE_PM_SEARCH,
     "welcome_enabled": True,      # video welcome when someone joins a group
     "filter_words": [],           # words/phrases dropped from every search query
+    # ── AI learning (plugins/learn.py) — all adjustable from /settings -> AI Learning
+    "ai_learning_enabled": True,   # master switch: False = observe nothing, suggest nothing
+    "ai_learn_retry": True,        # learn from "searched again and it worked"
+    "ai_learn_taps": True,         # learn from taps on suggestions / related titles
+    "ai_learn_requests": True,     # count requests as "wanted but missing"
+    "ai_type_alias": True,         # suggest spelling aliases
+    "ai_type_filterword": True,    # suggest filter words
+    "ai_type_noise": True,         # suggest uploader/channel words to ignore in titles
+    "ai_use_llm": False,           # let Groq/Gemini/TMDB double-check alias suggestions
+    "ai_min_users": 3,             # different users that must agree before a suggestion
+    "ai_daily_cap": 10,            # most suggestions posted per 24 hours
 }
 
 _cache: dict | None = None

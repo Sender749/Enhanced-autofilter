@@ -12,6 +12,7 @@ from pyrogram.errors import UserIsBlocked, RPCError
 
 from config import ADMINS, REQUEST_CHANNEL, MOVIE_GROUP_LINK
 from database.request_db import add_request
+from plugins.learn import note_request
 from database.settings_db import get_settings
 from utils import format_duration
 from strings import (
@@ -91,6 +92,7 @@ async def send_request(bot, user_id: int, query: str, username: str = None, orig
     # Store in database
     username = username or f"ID: {user_id}"
     await add_request(user_id, query, username)
+    asyncio.create_task(note_request(user_id, query))  # AI learning: wanted but missing
     
     # Build buttons
     buttons = []

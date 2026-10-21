@@ -96,6 +96,8 @@ def build_main_menu(settings: dict) -> InlineKeyboardMarkup:
          )],
         [InlineKeyboardButton(_status(settings["movie_update_notification"]), callback_data="cfg#tg#movieupd"),
          InlineKeyboardButton("🎬 Movie Updates", callback_data="cfg#m#movieupd")],
+        [InlineKeyboardButton(_status(settings["ai_learning_enabled"]), callback_data="cfg#tg#ailearn"),
+         InlineKeyboardButton("🧠 AI Learning", callback_data="ail#home")],
         [InlineKeyboardButton("📄 Export All Captions", callback_data="cfg#export")],
         [InlineKeyboardButton("🔁 Backfill Search Index", callback_data="cfg#backfill")],
         [InlineKeyboardButton("❌ Close", callback_data="cfg#close")],
@@ -314,6 +316,7 @@ async def settings_callback(bot, query):
             "autofilter": "autofilter_enabled",
             "pmfilter": "pm_filter_enabled",
             "welcome": "welcome_enabled",
+            "ailearn": "ai_learning_enabled",
         }.get(parts[2])
         if field:
             settings = await get_settings()

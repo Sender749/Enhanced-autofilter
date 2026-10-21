@@ -17,6 +17,7 @@ from database.filters_db import (
     related_titles, relaxed_search,
 )
 from database.alias_db import alias_key, create_miss, set_miss_message
+from plugins.learn import note_miss, note_success, note_tap
 from database.settings_db import get_settings
 from database.trending_db import record_search, title_of
 from filterwords import apply_filter_words
@@ -145,11 +146,11 @@ _SUGGESTION_CACHE: dict = {}
 _SUGGESTION_TRACKER: dict = {}  # Track suggestion messages for auto-request timeout
 
 
-def _suggestion_cache_put(key: str, titles: list):
+def _suggestion_cache_put(key: str, titles: list, query: str = ""):
     if len(_SUGGESTION_CACHE) >= _CACHE_MAX_ENTRIES:
         oldest = min(_SUGGESTION_CACHE, key=lambda k: _SUGGESTION_CACHE[k]["time"])
         _SUGGESTION_CACHE.pop(oldest, None)
-    _SUGGESTION_CACHE[key] = {"titles": titles, "time": time.time()}
+    _SUGGESTION_CACHE[key] = {"titles": titles, "time": time.time(), "query": query}
 
 
 def _suggestion_cache_get(key: str) -> list | None:
@@ -654,6 +655,7 @@ async def handle_search(bot, message):
         await _deliver_results(message, query, results)
         if not lang_year_only:
             asyncio.create_task(record_search(title_of(results, query)))
+            asyncio.create_task(note_success(message.from_user.id if message.from_user else None, results))
         asyncio.create_task(_schedule_delete(status, 0))
         return
 
@@ -696,11 +698,12 @@ async def handle_search(bot, message):
         status = await _status_update(status, STATUS_STAGE3_TXT)
         suggestions = await suggest_titles(query)
     user_id = message.from_user.id if message.from_user else None
+    asyncio.create_task(note_miss(user_id, query))  # AI learning: what users wanted but didn't get
 
     rows = []
     if suggestions:
         key = _cache_key(query)
-        _suggestion_cache_put(key, suggestions)
+        _suggestion_cache_put(key, suggestions, query)
         rows.extend(_suggestion_keyboard(key, suggestions).inline_keyboard)
     # Google search + Request to Admin under BOTH the suggestions message and
     # the plain "not found" message.
@@ -826,6 +829,9 @@ async def suggestion_clicked(_, query):
         return
 
     await _deliver_results(query.message, title, results)
+    original = _SUGGESTION_CACHE.get(key, {}).get("query", "")
+    if original:
+        asyncio.create_task(note_tap(query.from_user.id, original, title))  # AI learning
     asyncio.create_task(_schedule_delete(query.message, 0))
 
 

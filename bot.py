@@ -12,6 +12,7 @@ from config import (
     HELPER_BOT_TOKENS, FASTDL_SERVER_ENABLED, FASTDL_ENABLED,
 )
 from database.filters_db import ensure_indexes, backfill_word_index
+from plugins.learn import load_noise_words, start_learning
 from database.premium_db import ensure_indexes as ensure_premium_indexes
 from database.verify_db import ensure_indexes as ensure_verify_indexes
 from database.request_db import ensure_indexes as ensure_request_indexes
@@ -41,6 +42,7 @@ USER_COMMANDS = [
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("admin", "Admin commands panel"),
     BotCommand("settings", "Admin settings panel"),
+    BotCommand("ailearn", "AI learning panel"),
 ]
 
 
@@ -66,6 +68,10 @@ class Bot(Client):
 
     async def start(self):
         await ensure_indexes()
+        try:  # admin-approved "ignore this word" list must be loaded before any title is keyed
+            await load_noise_words()
+        except Exception:
+            logger.exception("Could not load AI noise words")
         # Fill in the search keys (words / tkeys) for files indexed before they
         # existed. Background + idempotent: a no-op once everything is migrated.
         asyncio.create_task(self._backfill_search_keys())
@@ -83,6 +89,7 @@ class Bot(Client):
         logger.info("Bot started as @%s (ID: %s)", me.username, me.id)
 
         await self._setup_commands()
+        start_learning(self)  # AI learning loop (does nothing while switched off in /settings)
 
         if FASTDL_SERVER_ENABLED:
             # Second session of the main token + any helper bots, download-only.

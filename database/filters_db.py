@@ -453,16 +453,85 @@ def clean_display_text(text: str) -> str:
 
 
 _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?>")
-_JUNK_RE = re.compile(
-    r"\b(s\d{1,2}e?\d{0,3}|season\s*\d+|ep(?:isode)?\.?\s*\d+|\d{3,4}p|4k|uhd|hdr\d*|"
+_LANG_ALTS = "|".join(re.escape(a) for aliases in _LANGUAGE_ALIASES.values() for a in aliases)
+_JUNK_ALTS = (
+    r"s\d{1,2}e?\d{0,3}|season\s*\d+|ep(?:isode)?\.?\s*\d+|\d{3,4}p|4k|uhd|hdr\d*|"
     r"bluray|bdrip|remux|web-?dl|webrip|hdrip|dvdrip|hdtv|cam|hdts|ts|"
     r"hevc|x264|x265|avc|av1|aac|ddp\d?\.?\d?|dts|flac|mp3|ac3|mp4|mkv|avi|mov|webm|m4v|m2ts|"
     r"esubs?|subs?|subbed|dubbed|dual\s*audio|multi\s*audio|dual|multi|"
     + "|".join(pat for _code, pat, _tokens in _SOURCE_RULES) + "|"
-    + "|".join(re.escape(a) for aliases in _LANGUAGE_ALIASES.values() for a in aliases)
-    + r")\b.*",
+    + _LANG_ALTS
+)
+_JUNK_RE = re.compile(r"\b(" + _JUNK_ALTS + r")\b.*", re.IGNORECASE)  # (used by plugins/learn.py)
+_TAG_RE = re.compile(r"\b(" + _JUNK_ALTS + r")\b", re.IGNORECASE)
+
+# "Soft" tags are ordinary words that are ALSO tags: a language name, Dual/Multi,
+# Sub/Dubbed, Cam, TS. "Hindi" in "Pushpa Hindi 1080p" is a tag; "English" in
+# "Johnny English Reborn" or "Cam" in "Video Cam Scam" is part of the title. So a
+# soft tag only starts the tag zone when what follows it is ALSO tag-like (more
+# tags, a number, a symbol, "Movie"/"Full"…, or the end of the text). Every
+# other tag (720p, WEB-DL, x264, S01E02, Netflix…) always starts it.
+_SOFT_RE = re.compile(
+    r"(?:" + _LANG_ALTS + r"|dual\s*audio|multi\s*audio|dual|multi|esubs?|subs?|subbed|dubbed|cam|hdts|ts)",
     re.IGNORECASE,
 )
+_TAG_FILLER = frozenset({
+    "movie", "movies", "film", "films", "full", "complete", "series", "show", "shows", "uncut",
+    "unrated", "extended", "org", "original", "hq", "new", "latest", "web", "bollywood", "hollywood",
+    "south", "audio", "version", "print", "quality", "episode", "episodes", "part", "dd", "and",
+    "dub", "dubs", "kbps", "tsrip", "rip", "scr", "line", "hc", "bit", "atmos", "dolby", "digital",
+    "sci", "fi", "combined", "completed", "season", "seasons", "all", "opus", "clear", "nf",
+})
+_NEXT_TOKEN_RE = re.compile(r"[\W_]*([^\W_]+)?")
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+")
+_MIXED_TAG_RE = re.compile(r"[A-Za-z]{1,6}\d[\w]*|\d+[A-Za-z]+\d*")  # AAC5, DD5, 224Kbps, H264, 10bit
+
+
+def _is_tag_token(tok: str) -> bool:
+    if tok.isdigit() or tok.lower() in _TAG_FILLER or _MIXED_TAG_RE.fullmatch(tok):
+        return True
+    m = _TAG_RE.match(tok)
+    return bool(m and m.end() == len(tok))
+
+
+def _continues_title(t: str, soft_match):
+    """If a soft tag (a language name, Cam, Dual…) is really a word of the
+    title — "Johnny English Reborn", "Video Cam Scam", "A Korean Odyssey" —
+    return where that title part ends: the start of the tag-like word that
+    follows (or len(t)). Otherwise None.
+    It is a title word when 1-3 plain words follow it, then tags or the end,
+    the words are plain Latin text (a description in another script is not a
+    title), and the tag word is written like the words around it (a lone
+    lower-case "hindi" in "Ugly Aur Pagli hindi Ranvir Shorey …" is a tag)."""
+    run, end = [], len(t)
+    for m in _WORD_TOKEN_RE.finditer(t, soft_match.end()):
+        if _is_tag_token(m.group(0)):
+            end = m.start()
+            break
+        run.append(m.group(0))
+        if len(run) > 3:
+            return None
+    if not run or not all(tok.isascii() for tok in run):
+        return None
+    if soft_match.group(1)[0].isupper() or t.islower():
+        return end
+    return None
+
+
+def _tag_cut_position(t: str, start: int = 0) -> int:
+    """Where the tag zone (language / quality / source / S01E01 …) starts in
+    `t`, looking from `start`; len(t) when there is none."""
+    ends = []  # where a title that kept a soft tag stops (at the next tag-like word)
+    for m in _TAG_RE.finditer(t, start):
+        if _SOFT_RE.fullmatch(m.group(1)):
+            end = _continues_title(t, m)
+            if end is not None:
+                ends.append(end)
+                continue
+        return min([m.start()] + ends)
+    return min(ends) if ends else len(t)
+
+
 _FIRST_WORD_RE = re.compile(r"^[\W_]*\w+")
 _TITLE_PUNCT_RE = re.compile(r"[._\-+\[\]()'\"~]+")
 _TITLE_SPACE_RE = re.compile(r"\s{2,}")
@@ -548,8 +617,7 @@ def clean_title(text: str) -> str:
     # cut junk markers that come after it.
     head_match = _FIRST_WORD_RE.match(t)
     split = head_match.end() if head_match else 0
-    junk = _JUNK_RE.search(t, split)
-    stop = junk.start() if junk else len(t)
+    stop = _tag_cut_position(t, split)
 
     # The release year is the most reliable end-of-title marker: in
     # "Jawan (2023) Extended Cut Bollywood Hindi ..." everything after it is
@@ -568,9 +636,9 @@ def clean_title(text: str) -> str:
     head_match = _FIRST_WORD_RE.match(t)
     if head_match:
         head, tail = t[:head_match.end()], t[head_match.end():]
-        t = head + _JUNK_RE.sub(" ", tail)
+        t = head + tail[:_tag_cut_position(tail)]
     else:
-        t = _JUNK_RE.sub(" ", t)
+        t = t[:_tag_cut_position(t)]
     t = _TITLE_PUNCT_RE.sub(" ", t)
     return _TITLE_SPACE_RE.sub(" ", t).strip(" \t•|:,;/\\")
 
@@ -590,7 +658,7 @@ def clean_title(text: str) -> str:
 # Bump this whenever the rules that build a title key change (clean_title /
 # title_key). Files stored with an older number are re-keyed automatically by
 # the startup backfill, so a rule change never leaves old files behind.
-KEY_VERSION = 3
+KEY_VERSION = 4
 _KEY_STOPWORDS = frozenset()  # articles (the/a/an) are NOT dropped: "The Flash" and "Flash" are different titles
 _KEY_WORD_RE = re.compile(r"[^\W_]+")
 _KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")

@@ -630,12 +630,23 @@ async def handle_search(bot, message):
         await message.reply_text(MAINTENANCE_TXT, quote=True)
         return
 
-    # Admin-defined filter words are dropped from the query before searching.
+    # Admin-defined filter words ("movie", "full movie"…) are dropped from the
+    # query — but only if the words EXACTLY as typed find nothing. A real title
+    # can contain one: with "de" as a filter word, "Kankaan de ohle" would
+    # otherwise be searched as "Kankaan ohle" and never found.
+    typed = query
+    variants = [typed]   # what the later stages (typo fix, related titles, suggestions) try, in order
+    prefetched = None    # Stage-1 result for the typed words, when they already found something
     if settings["filter_words"]:
-        query = apply_filter_words(query, settings["filter_words"])
-        if not query:
-            await message.reply_text(EMPTY_QUERY_TXT, quote=True)
-            return
+        filtered = apply_filter_words(typed, settings["filter_words"])
+        if filtered != typed:
+            prefetched = await search_files(typed)
+            if not prefetched:
+                if not filtered:
+                    await message.reply_text(EMPTY_QUERY_TXT, quote=True)
+                    return
+                query = filtered
+                variants = [typed, filtered]
 
     # The "Searching..." status message is sent concurrently with the real
     # Stage 1 work below, not before it — so showing search progress never
@@ -647,7 +658,7 @@ async def handle_search(bot, message):
     # title of its own — no trending entry for it (its poster still comes
     # from the result files, like every other search).
     lang_year_only = is_language_year_query(query)
-    results = await search_files(query)
+    results = prefetched or await search_files(query)
     status = await status_task
 
     if results:
@@ -673,10 +684,14 @@ async def handle_search(bot, message):
     # match and every word must score high individually).
     status = await _status_update(status, STATUS_STAGE2_TXT)
 
-    hit = await fuzzy_correct(query)
+    hit = None
+    for candidate in variants:
+        hit = await fuzzy_correct(candidate)
+        if hit:
+            break
     if hit:
         resolved_query, results = hit
-        await _deliver_results(message, resolved_query, results, original_query=query)
+        await _deliver_results(message, resolved_query, results, original_query=typed)
         asyncio.create_task(record_search(title_of(results, resolved_query)))
         asyncio.create_task(_schedule_delete(status, 0))
         return
@@ -691,14 +706,22 @@ async def handle_search(bot, message):
     # ("pushpa" -> "Pushpa The Rise", "Pushpa 2 The Rule"): they are real,
     # they have files, and it needs no outside API. Only when there are none
     # does the bot ask TMDB/OMDb/AI for suggestions.
-    related = await related_titles(query)
+    related = []
+    for candidate in variants:
+        related = await related_titles(candidate)
+        if related:
+            break
     if related:
         suggestions = related
     else:
         status = await _status_update(status, STATUS_STAGE3_TXT)
-        suggestions = await suggest_titles(query)
+        suggestions = []
+        for candidate in variants:
+            suggestions = await suggest_titles(candidate)
+            if suggestions:
+                break
     user_id = message.from_user.id if message.from_user else None
-    asyncio.create_task(note_miss(user_id, query))  # AI learning: what users wanted but didn't get
+    asyncio.create_task(note_miss(user_id, typed))  # AI learning: what users wanted but didn't get
 
     rows = []
     if suggestions:

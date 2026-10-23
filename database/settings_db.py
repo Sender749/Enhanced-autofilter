@@ -68,6 +68,7 @@ DEFAULTS = {
     "ai_use_llm": False,           # let Groq/Gemini/TMDB double-check alias suggestions
     "ai_min_users": 3,             # different users that must agree before a suggestion
     "ai_daily_cap": 10,            # most suggestions posted per 24 hours
+    "query_log_enabled": True,     # save every search query so admins can export them
 }
 
 _cache: dict | None = None

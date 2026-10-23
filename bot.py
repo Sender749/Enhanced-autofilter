@@ -43,6 +43,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("admin", "Admin commands panel"),
     BotCommand("settings", "Admin settings panel"),
     BotCommand("ailearn", "AI learning panel"),
+    BotCommand("exportqueries", "Export user search queries"),
 ]
 
 

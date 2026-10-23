@@ -18,6 +18,7 @@ from database.filters_db import (
 )
 from database.alias_db import alias_key, create_miss, set_miss_message
 from plugins.learn import note_miss, note_success, note_tap
+from database.query_log_db import log_query
 from database.settings_db import get_settings
 from database.trending_db import record_search, title_of
 from filterwords import apply_filter_words
@@ -635,6 +636,14 @@ async def handle_search(bot, message):
     # can contain one: with "de" as a filter word, "Kankaan de ohle" would
     # otherwise be searched as "Kankaan ohle" and never found.
     typed = query
+    _uid = message.from_user.id if message.from_user else None
+    _private = message.chat.type == enums.ChatType.PRIVATE
+
+    def _log(outcome: str, shown: int = 0, title: str = ""):
+        # Save the search (what was typed + what the bot did) for the admin export.
+        if settings["query_log_enabled"]:
+            asyncio.create_task(log_query(_uid, typed, outcome, shown, title, _private))
+
     variants = [typed]   # what the later stages (typo fix, related titles, suggestions) try, in order
     prefetched = None    # Stage-1 result for the typed words, when they already found something
     if settings["filter_words"]:
@@ -664,6 +673,7 @@ async def handle_search(bot, message):
     if results:
         # Stage 1 already found it — the common, fast path.
         await _deliver_results(message, query, results)
+        _log("found", len(results), title_of(results, query))
         if not lang_year_only:
             asyncio.create_task(record_search(title_of(results, query)))
             asyncio.create_task(note_success(message.from_user.id if message.from_user else None, results))
@@ -675,6 +685,7 @@ async def handle_search(bot, message):
     if not lang_year_only:
         relaxed = await relaxed_search(query)
         if relaxed:
+            _log("relaxed", len(relaxed["results"]), relaxed["title"])
             await _deliver_relaxed(message, status, query, relaxed, settings)
             return
 
@@ -692,6 +703,7 @@ async def handle_search(bot, message):
     if hit:
         resolved_query, results = hit
         await _deliver_results(message, resolved_query, results, original_query=typed)
+        _log("fuzzy", len(results), resolved_query)
         asyncio.create_task(record_search(title_of(results, resolved_query)))
         asyncio.create_task(_schedule_delete(status, 0))
         return
@@ -722,6 +734,7 @@ async def handle_search(bot, message):
                 break
     user_id = message.from_user.id if message.from_user else None
     asyncio.create_task(note_miss(user_id, typed))  # AI learning: what users wanted but didn't get
+    _log("related" if related else "suggested" if suggestions else "none")
 
     rows = []
     if suggestions:

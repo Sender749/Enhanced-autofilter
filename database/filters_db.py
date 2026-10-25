@@ -1142,6 +1142,17 @@ async def search_files(query: str, use_alias: bool = True) -> list:
     return results[:_MAX_FETCH]
 
 
+async def search_by_title_keys(keys: list) -> list:
+    """Every file stored under any of these title keys (a title with several
+    spellings has several), best quality first — the same ordering search_files uses."""
+    if not keys:
+        return []
+    cursor = files.find({"tkeys": {"$in": list(keys)}}, _RESULT_FIELDS).limit(_CANDIDATE_FETCH)
+    results = await cursor.to_list(length=_CANDIDATE_FETCH)
+    results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
+    return results[:_MAX_FETCH]
+
+
 async def relaxed_search(query: str) -> dict | None:
     """
     For a query whose TITLE exists but whose extra tag (season / episode / year

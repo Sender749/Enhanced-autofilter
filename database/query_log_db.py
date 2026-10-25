@@ -40,6 +40,7 @@ OUTCOMES = {
     "found": "found it",
     "fuzzy": "typo fixed",
     "relaxed": "title found, extra tag (season/year/…) missing",
+    "titles": "several titles offered as buttons",
     "related": "only related titles offered",
     "suggested": "only outside suggestions offered",
     "none": "nothing found",

@@ -14,7 +14,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK
 from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
-    related_titles, relaxed_search,
+    related_titles, relaxed_search, parse_query,
 )
 from database.alias_db import alias_key, create_miss, set_miss_message
 from plugins.learn import note_miss, note_success, note_tap
@@ -24,7 +24,8 @@ from database.trending_db import record_search, title_of
 from filterwords import apply_filter_words
 from linkcheck import has_link
 from poster import fetch_poster_for_results
-from spellcheck import fuzzy_correct, suggest_titles
+from spellcheck import fuzzy_alternatives, fuzzy_correct, suggest_titles
+from titleindex import button_label, buttons_for, files_for_button
 from utils import temp, human_size, format_duration
 from strings import (
     NOT_FOUND_TXT, RESULT_HEADER_TXT, RESULT_HEADER_CORRECTED_TXT, POSTER_CAPTION_TXT,
@@ -33,6 +34,7 @@ from strings import (
     STATUS_STAGE1_TXT, STATUS_STAGE2_TXT, STATUS_STAGE3_TXT,
     SUGGESTIONS_HEADER_TXT, SUGGESTION_NOT_FOUND_TXT, RELATED_HEADER_TXT,
     SEASON_MENU_TXT, SEASON_BTN, SEASON_ALL_BTN, RELAXED_NOTE_TXT, RELAXED_AVAILABLE_TXT,
+    TITLE_PICK_TXT, TITLE_MORE_BTN, TITLE_MORE_HEADER_TXT, ALT_BTN, ALT_HEADER_TXT,
     REQUEST_BTN_TXT, REQUEST_NOT_CONFIGURED_TXT, REQUEST_SENT_TXT,
     MAINTENANCE_TXT, EMPTY_QUERY_TXT,
     PM_SEARCH_OFF_TXT, PM_SEARCH_OFF_BTN,
@@ -107,7 +109,7 @@ def _cache_get(key: str) -> dict | None:
 
 
 def _cache_put(key: str, query: str, results: list, mode: str, poster, original_query: str | None = None,
-               note: str | None = None) -> dict:
+               note: str | None = None, extra_rows: list | None = None) -> dict:
     if len(_CACHE) >= _CACHE_MAX_ENTRIES:
         oldest = min(_CACHE, key=lambda k: _CACHE[k]["time"])
         _CACHE.pop(oldest, None)
@@ -115,6 +117,7 @@ def _cache_put(key: str, query: str, results: list, mode: str, poster, original_
         "query": query,
         "original_query": original_query,  # set only when a typo-correction was used
         "note": note,  # one extra line under the header (e.g. "Season 5 isn't available")
+        "extra": extra_rows or [],  # extra button rows ("More titles", "Not this? See other matches")
         "results": results,
         "mode": mode,
         "meta": extract_meta(results),
@@ -350,6 +353,7 @@ def _render(key: str, entry: dict, offset: int):
                 label, url=f"https://t.me/{temp.U_NAME}?start=file_{doc['_id']}"
             )])
 
+    rows.extend(entry.get("extra", []))
     if filters_active:
         rows.append([InlineKeyboardButton(HOME_BTN, callback_data=f"home#{key}")])
     rows.append(_nav_row(key, offset, total))
@@ -455,7 +459,8 @@ async def _status_update(message, text: str, markup=None):
 
 
 async def _deliver_results(message, resolved_query: str, results: list,
-                            original_query: str | None = None, note: str | None = None):
+                            original_query: str | None = None, note: str | None = None,
+                            extra_rows: list | None = None):
     """Send the poster (if found) + the results/filter message — the exact
     same flow whether Stage 1 found it directly or the user just clicked a
     Stage-3 suggestion button. The poster always comes from the result
@@ -466,7 +471,7 @@ async def _deliver_results(message, resolved_query: str, results: list,
     settings = await get_settings()
     mode = settings["result_mode"]
     key = _cache_key(resolved_query)
-    entry = _cache_put(key, resolved_query, results, mode, poster, original_query, note)
+    entry = _cache_put(key, resolved_query, results, mode, poster, original_query, note, extra_rows)
 
     text, markup = _render(key, entry, offset=0)
     if settings["query_autodelete_enabled"]:
@@ -490,6 +495,159 @@ async def _deliver_results(message, resolved_query: str, results: list,
     if settings["query_autodelete_enabled"]:
         for m in to_delete:
             asyncio.create_task(_schedule_delete(m, settings["query_autodelete_seconds"]))
+
+
+# ── Several titles match: let the user pick ─────────────────────────────────
+# "bahubali" is not one movie — Baahubali, The Beginning, The Conclusion, The Epic…
+# Instead of guessing one (or listing 66 files of mixed titles) the bot shows one
+# button per title (spelling variants merged; remakes split by year) and then the
+# files of the one the user taps.
+_TITLE_CACHE: dict = {}
+_TITLES_PER_PAGE = 8
+_FILLER_WORDS = frozenset({"movie", "movies", "film", "films", "download", "full", "hd"})
+
+
+def _strip_filler(text: str) -> str:
+    """"pushpa 2 full movie download" -> "pushpa 2". Only tried when nothing was found."""
+    return " ".join(w for w in text.split() if re.sub(r"\W", "", w).lower() not in _FILLER_WORDS)
+
+
+def _has_tags(query: str) -> bool:
+    return any(v is not None for v in parse_query(query)[1].values())
+
+
+def _title_cache_put(key: str, buttons: list, query: str):
+    if len(_TITLE_CACHE) >= _CACHE_MAX_ENTRIES:
+        oldest = min(_TITLE_CACHE, key=lambda k: _TITLE_CACHE[k]["time"])
+        _TITLE_CACHE.pop(oldest, None)
+    _TITLE_CACHE[key] = {"buttons": buttons, "query": query, "time": time.time()}
+
+
+def _title_cache_get(key: str) -> dict | None:
+    entry = _TITLE_CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["time"] > _CACHE_TTL:
+        _TITLE_CACHE.pop(key, None)
+        return None
+    return entry
+
+
+def _title_menu(key: str, entry: dict, offset: int, header: str):
+    buttons = entry["buttons"]
+    offset = max(0, min(offset, max(0, len(buttons) - 1)))
+    rows = []
+    for i in range(offset, min(offset + _TITLES_PER_PAGE, len(buttons))):
+        label = "🎬 " + button_label(buttons[i])
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"tt#{key}#{i}")])
+    if len(buttons) > _TITLES_PER_PAGE:
+        pages = math.ceil(len(buttons) / _TITLES_PER_PAGE)
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"tp#{key}#{max(0, offset - _TITLES_PER_PAGE)}"))
+        nav.append(InlineKeyboardButton(f"📄 {offset // _TITLES_PER_PAGE + 1}/{pages}", callback_data="noop"))
+        if offset + _TITLES_PER_PAGE < len(buttons):
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"tp#{key}#{offset + _TITLES_PER_PAGE}"))
+        rows.append(nav)
+    return header, InlineKeyboardMarkup(rows)
+
+
+async def _title_choice(query: str):
+    """For a search the bot already found files for: does the query ALSO match other
+    titles? Returns None (just show the files) or
+      {"mode": "files",   ...}  the exact title holds half or more of all matching
+                                files -> show its files + a "More titles" button
+      {"mode": "buttons", ...}  otherwise -> title buttons, exact title first"""
+    buttons = await buttons_for(query)
+    if len({tuple(b["members"]) for b in buttons}) <= 1:
+        return None
+    exact = sum(b["n"] for b in buttons if b["tier"] == 0)
+    total = sum(b["n"] for b in buttons)
+    return {"mode": "files" if exact and exact * 2 >= total else "buttons", "buttons": buttons}
+
+
+async def _deliver_title_menu(status, query: str, buttons: list, settings: dict):
+    key = _cache_key("titles:" + query)
+    _title_cache_put(key, buttons, query)
+    count = len({tuple(b["members"]) for b in buttons})
+    text, markup = _title_menu(key, _TITLE_CACHE[key], 0,
+                               TITLE_PICK_TXT.format(query=html.escape(query), count=count))
+    if settings["query_autodelete_enabled"]:
+        text += QUERY_AUTODELETE_NOTE.format(duration=format_duration(settings["query_autodelete_seconds"]))
+    status = await _status_update(status, text, markup)
+    if settings["query_autodelete_enabled"]:
+        asyncio.create_task(_schedule_delete(status, settings["query_autodelete_seconds"]))
+
+
+@Client.on_callback_query(filters.regex(r"^tt#"))
+async def title_clicked(_, query):
+    _, key, idx = query.data.split("#")
+    entry = _title_cache_get(key)
+    await query.answer()
+    if not entry or int(idx) >= len(entry["buttons"]):
+        await _expired(query.message)
+        return
+    btn = entry["buttons"][int(idx)]
+    _SUGGESTION_TRACKER.pop(query.message.id, None)
+    results = await files_for_button(btn)
+    if not results:
+        await query.message.edit_text(
+            SUGGESTION_NOT_FOUND_TXT.format(title=html.escape(btn["title"])) + _remaining_note(query.message),
+            reply_markup=InlineKeyboardMarkup(_action_rows(btn["title"], query.from_user.id)),
+        )
+        return
+    label = btn["title"] + (f" ({btn['year_label']})" if btn["years"] is not None else "")
+    await _deliver_results(query.message, label, results)
+    asyncio.create_task(record_search(btn["title"]))
+    asyncio.create_task(_schedule_delete(query.message, 0))
+
+
+@Client.on_callback_query(filters.regex(r"^tp#"))
+async def title_page(_, query):
+    _, key, offset = query.data.split("#")
+    entry = _title_cache_get(key)
+    await query.answer()
+    if not entry:
+        await _expired(query.message)
+        return
+    count = len({tuple(b["members"]) for b in entry["buttons"]})
+    header = TITLE_PICK_TXT.format(query=html.escape(entry["query"]), count=count)
+    text, markup = _title_menu(key, entry, int(offset), header)
+    await _push(query.message, text + _remaining_note(query.message), markup)
+
+
+@Client.on_callback_query(filters.regex(r"^mt#"))
+async def more_titles(_, query):
+    _, key = query.data.split("#")
+    entry = _title_cache_get(key)
+    await query.answer()
+    if not entry:
+        await _expired(query.message)
+        return
+    text, markup = _title_menu(key, entry, 0, TITLE_MORE_HEADER_TXT.format(query=html.escape(entry["query"])))
+    sent = await query.message.reply_text(text, reply_markup=markup)
+    settings = await get_settings()
+    if settings["query_autodelete_enabled"]:
+        asyncio.create_task(_schedule_delete(sent, settings["query_autodelete_seconds"]))
+
+
+@Client.on_callback_query(filters.regex(r"^alt#"))
+async def other_matches(_, query):
+    _, key = query.data.split("#")
+    titles = _suggestion_cache_get(key)
+    await query.answer()
+    if not titles:
+        await _expired(query.message)
+        return
+    original = _SUGGESTION_CACHE.get(key, {}).get("query", "")
+    sent = await query.message.reply_text(
+        ALT_HEADER_TXT.format(query=html.escape(original)), reply_markup=_suggestion_keyboard(key, titles),
+    )
+    settings = await get_settings()
+    if settings["query_autodelete_enabled"]:
+        asyncio.create_task(_schedule_delete(sent, settings["query_autodelete_seconds"]))
 
 
 # ── "Title exists, but not that season / year / language / quality" ─────────
@@ -644,35 +802,64 @@ async def handle_search(bot, message):
         if settings["query_log_enabled"]:
             asyncio.create_task(log_query(_uid, typed, outcome, shown, title, _private))
 
-    variants = [typed]   # what the later stages (typo fix, related titles, suggestions) try, in order
-    prefetched = None    # Stage-1 result for the typed words, when they already found something
+    # What to try, in order: the words exactly as typed; then without the admin's
+    # filter words; then also without filler words (movie, film, download…).
+    variants = [typed]
+    emptied = False   # the filter words would leave nothing of the query
     if settings["filter_words"]:
         filtered = apply_filter_words(typed, settings["filter_words"])
         if filtered != typed:
-            prefetched = await search_files(typed)
-            if not prefetched:
-                if not filtered:
-                    await message.reply_text(EMPTY_QUERY_TXT, quote=True)
-                    return
-                query = filtered
-                variants = [typed, filtered]
+            if filtered:
+                variants.append(filtered)
+            else:
+                emptied = True
+    bare = _strip_filler(variants[-1])
+    if bare and bare.lower() != variants[-1].lower() and bare not in variants:
+        variants.append(bare)
 
     # The "Searching..." status message is sent concurrently with the real
     # Stage 1 work below, not before it — so showing search progress never
     # adds latency to the common case where Stage 1 already finds it.
     status_task = asyncio.create_task(
-        message.reply_text(STATUS_STAGE1_TXT.format(query=html.escape(query)), quote=True)
+        message.reply_text(STATUS_STAGE1_TXT.format(query=html.escape(typed)), quote=True)
     )
+    results, query = [], variants[-1]
+    for candidate in variants:
+        results = await search_files(candidate)
+        if results:
+            query = candidate
+            break
+    status = await status_task
     # A query that is only language and/or year (e.g. "Hindi 2024") has no
     # title of its own — no trending entry for it (its poster still comes
     # from the result files, like every other search).
     lang_year_only = is_language_year_query(query)
-    results = prefetched or await search_files(query)
-    status = await status_task
+
+    if not results and emptied:
+        asyncio.create_task(_schedule_delete(status, 0))
+        await message.reply_text(EMPTY_QUERY_TXT, quote=True)
+        return
 
     if results:
-        # Stage 1 already found it — the common, fast path.
-        await _deliver_results(message, query, results)
+        # Stage 1 already found it — the common, fast path. If the words also match
+        # OTHER titles ("bahubali": The Beginning, The Conclusion, The Epic…), the
+        # user is asked which one — unless the exact title already holds half or more
+        # of the matching files, then its files come first with a "More titles" button.
+        choice = None
+        if not lang_year_only and not _has_tags(query):
+            choice = await _title_choice(query)
+        if choice and choice["mode"] == "buttons":
+            _log("titles", len(choice["buttons"]))
+            await _deliver_title_menu(status, query, choice["buttons"], settings)
+            return
+        extra = None
+        if choice:
+            more = [b for b in choice["buttons"] if b["tier"] != 0]
+            if more:
+                mkey = _cache_key("more:" + query)
+                _title_cache_put(mkey, more, query)
+                extra = [[InlineKeyboardButton(TITLE_MORE_BTN.format(n=len(more)), callback_data=f"mt#{mkey}")]]
+        await _deliver_results(message, query, results, extra_rows=extra)
         _log("found", len(results), title_of(results, query))
         if not lang_year_only:
             asyncio.create_task(record_search(title_of(results, query)))
@@ -689,20 +876,53 @@ async def handle_search(bot, message):
             await _deliver_relaxed(message, status, query, relaxed, settings)
             return
 
-    # Stage 2 — fuzzy match against your own DB's titles. Free, in-memory,
-    # a few milliseconds. Catches ordinary typos without ever cross-
-    # matching a different-but-similar-looking title (word count must
+    # Phrase search — titles that ARE, START WITH or CONTAIN the words, spelling-
+    # proof (Bahubali = Baahubali). One title -> its files; several -> title buttons.
+    if not lang_year_only:
+        buttons, used = [], query
+        for candidate in variants:
+            buttons = await buttons_for(candidate)
+            if buttons:
+                used = candidate
+                break
+        if buttons:
+            if len(buttons) == 1:
+                found = await files_for_button(buttons[0])
+                if found:
+                    label = buttons[0]["title"] + (f" ({buttons[0]['year_label']})" if buttons[0]["years"] is not None else "")
+                    await _deliver_results(message, label, found)
+                    _log("found", len(found), label)
+                    asyncio.create_task(record_search(buttons[0]["title"]))
+                    asyncio.create_task(_schedule_delete(status, 0))
+                    return
+            else:
+                _log("titles", len(buttons))
+                await _deliver_title_menu(status, used, buttons, settings)
+                return
+
+    # Stage 2 — fuzzy match against EVERY title in your database (titleindex.py).
+    # Free, in-memory, tens of milliseconds. Catches ordinary typos without ever
+    # cross-matching a different-but-similar-looking title (word count must
     # match and every word must score high individually).
     status = await _status_update(status, STATUS_STAGE2_TXT)
 
-    hit = None
+    hit, used = None, query
     for candidate in variants:
         hit = await fuzzy_correct(candidate)
         if hit:
+            used = candidate
             break
     if hit:
         resolved_query, results = hit
-        await _deliver_results(message, resolved_query, results, original_query=typed)
+        # It always shows the closest title, but when other titles are almost as close
+        # a button lets the user look at them instead.
+        extra = None
+        alternatives = await fuzzy_alternatives(used, resolved_query)
+        if alternatives:
+            akey = _cache_key("alt:" + typed)
+            _suggestion_cache_put(akey, alternatives, typed)
+            extra = [[InlineKeyboardButton(ALT_BTN, callback_data=f"alt#{akey}")]]
+        await _deliver_results(message, resolved_query, results, original_query=typed, extra_rows=extra)
         _log("fuzzy", len(results), resolved_query)
         asyncio.create_task(record_search(title_of(results, resolved_query)))
         asyncio.create_task(_schedule_delete(status, 0))

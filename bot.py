@@ -13,6 +13,7 @@ from config import (
 )
 from database.filters_db import ensure_indexes, backfill_word_index
 from plugins.learn import load_noise_words, start_learning
+from titleindex import ensure_index as ensure_title_index
 from database.premium_db import ensure_indexes as ensure_premium_indexes
 from database.verify_db import ensure_indexes as ensure_verify_indexes
 from database.request_db import ensure_indexes as ensure_request_indexes
@@ -59,6 +60,12 @@ class Bot(Client):
             plugins={"root": "plugins"},
         )
 
+    async def _build_title_index(self):
+        try:
+            await ensure_title_index()
+        except Exception:
+            logger.exception("Title index build failed (it is rebuilt on the first search)")
+
     async def _backfill_search_keys(self):
         try:
             updated = await backfill_word_index()
@@ -76,6 +83,7 @@ class Bot(Client):
         # Fill in the search keys (words / tkeys) for files indexed before they
         # existed. Background + idempotent: a no-op once everything is migrated.
         asyncio.create_task(self._backfill_search_keys())
+        asyncio.create_task(self._build_title_index())  # all titles in memory: typo fixer + phrase search
         await ensure_premium_indexes()
         await ensure_verify_indexes()
         await ensure_request_indexes()

@@ -27,6 +27,7 @@ import re
 import time
 
 import aiohttp
+from rapidfuzz import fuzz
 from rapidfuzz.distance import DamerauLevenshtein
 
 from config import (
@@ -48,15 +49,11 @@ _TITLE_CACHE_FETCH_LIMIT = 8000   # bounded — cheap even on a huge collection
 
 
 async def _rebuild_title_cache() -> list:
-    seen, result = set(), []
-    cursor = files.find({}, {"file_name": 1, "caption": 1, "_id": 0}).limit(_TITLE_CACHE_FETCH_LIMIT)
-    async for doc in cursor:
-        clean = clean_title(display_name(doc))
-        key = clean.lower()
-        if key and key not in seen:
-            seen.add(key)
-            result.append((key, clean))
-    return result
+    # EVERY distinct title in the database (titleindex.py). This used to read only
+    # the first 8,000 FILES — about 11% of a 72,000-file database — so the typo fixer
+    # could not even see most titles.
+    from titleindex import title_cache
+    return list(await title_cache())
 
 
 async def _get_title_cache() -> list:
@@ -136,6 +133,18 @@ def _sequel_number_preserved(original: str, candidate: str) -> bool:
 _SYMBOLS_RE = re.compile(r"[^\w\s]+")
 
 
+_COLLAPSED_MIN = 92  # typo AND different spacing: "spidermam no way home" ~ "Spider Man No Way Home"
+
+
+def _collapsed_score(q_words: list, cand_words: list) -> float:
+    """Compare the two titles with the spaces removed, so a typo and a spacing
+    difference in the same title are still caught. Strict on purpose."""
+    a, b = "".join(q_words), "".join(cand_words)
+    if abs(len(a) - len(b)) > 2:
+        return 0.0
+    return fuzz.ratio(a, b)
+
+
 def _best_fuzzy_match(query: str, cache: list):
     """Pure CPU work — called via asyncio.to_thread so it never blocks the
     event loop while other users' searches are being served."""
@@ -154,13 +163,53 @@ def _best_fuzzy_match(query: str, cache: list):
         cand_words = _SYMBOLS_RE.sub(" ", key).split()
         if "".join(cand_words) == q_collapsed:
             return original  # same letters, just spacing/punctuation differs
-        if not _word_count_ok(q_words, cand_words):
-            continue
-        score = _per_word_score(q_words, cand_words)
+        score = _per_word_score(q_words, cand_words) if _word_count_ok(q_words, cand_words) else 0.0
+        collapsed = _collapsed_score(q_words, cand_words)
+        if collapsed >= _COLLAPSED_MIN:
+            score = max(score, collapsed)
         if score > best_score:
             best_score, best_title = score, original
 
     return best_title if best_score >= FUZZY_MATCH_THRESHOLD else None
+
+
+def _ranked_fuzzy(query: str, cache: list, limit: int) -> list:
+    """[(score, title)] best first — the same rules as _best_fuzzy_match, but
+    keeping the runners-up that are still reasonably close."""
+    q_words = _SYMBOLS_RE.sub(" ", clean_title(query).lower()).split()
+    if not q_words:
+        return []
+    floor = FUZZY_MATCH_THRESHOLD - 8
+    scored = []
+    for key, original in cache:
+        if not _sequel_number_preserved(query, key):
+            continue
+        cand_words = _SYMBOLS_RE.sub(" ", key).split()
+        if "".join(cand_words) == "".join(q_words):
+            score = 100.0
+        else:
+            score = _per_word_score(q_words, cand_words) if _word_count_ok(q_words, cand_words) else 0.0
+            collapsed = _collapsed_score(q_words, cand_words)
+            if collapsed >= _COLLAPSED_MIN:
+                score = max(score, collapsed)
+        if score >= floor:
+            scored.append((score, original))
+    scored.sort(key=lambda s: -s[0])
+    return scored[:limit]
+
+
+async def fuzzy_alternatives(query: str, exclude: str = "", limit: int = 3) -> list:
+    """Other titles that are almost as close as the one the typo fixer picked —
+    offered under its result as "Not this? See other matches"."""
+    cache = await _get_title_cache()
+    if not cache:
+        return []
+    ranked = await asyncio.to_thread(_ranked_fuzzy, query, cache, limit + 3)
+    out = []
+    for _score, title in ranked:
+        if title.lower() != exclude.lower() and title not in out:
+            out.append(title)
+    return out[:limit]
 
 
 async def fuzzy_correct(query: str):

@@ -152,6 +152,11 @@ async def transition(miss_id: str, from_states: list, new_state: str, extra: dic
     )
 
 
+async def find_report(chat_msg_id: int) -> dict | None:
+    """The not-found report that owns this channel message, in ANY state."""
+    return await misses.find_one({"chat_msg_id": chat_msg_id})
+
+
 async def find_waiting_by_reply(reply_to_id: int) -> dict | None:
     """The miss an admin's channel reply is answering (reply goes to the report
     message itself, or to the 'no match' follow-up the bot posted under it)."""

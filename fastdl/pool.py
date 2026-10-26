@@ -14,7 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from pyrogram import Client, raw
-from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FileReferenceInvalid
+from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FileReferenceInvalid, FloodWait
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
 
@@ -36,9 +36,10 @@ class Meta:
 
 
 class _Worker:
-    def __init__(self, client: Client, bin_channel: int):
+    def __init__(self, client: Client, bin_channel: int, owned: bool = True):
         self.client = client
         self.bin_channel = bin_channel
+        self.owned = owned  # False = the main bot's own client; the pool must never stop it
         self.active = 0
         self._sessions: dict[int, Session] = {}
         self._locks: dict[int, asyncio.Lock] = {}
@@ -153,6 +154,8 @@ class _Worker:
     async def stop(self):
         for dc in list(self._sessions):
             await self._drop_session(dc)
+        if not self.owned:
+            return  # main bot client: the bot itself stops it
         try:
             await self.client.stop()
         except Exception:
@@ -163,13 +166,25 @@ class StreamPool:
     def __init__(self):
         self.workers: list[_Worker] = []
         self._meta: OrderedDict = OrderedDict()  # msg_id -> (Meta, ts)
+        self._cfg = None            # (api_id, api_hash, tokens, bin_channel) from the last start()
+        self._main = None           # the main bot client, if add_main_client() was used
+        self._recover_lock = asyncio.Lock()
+        self._last_recover = 0.0
 
-    async def start(self, api_id: int, api_hash: str, tokens: list, bin_channel: int):
-        seen = set()
-        for i, token in enumerate(tokens):
-            if not token or token in seen:
-                continue
-            seen.add(token)
+    def add_main_client(self, client: Client, bin_channel: int):
+        """Use the ALREADY-RUNNING main bot client as a stream worker. No second
+        login with the same bot token is needed, so this can never fail to start
+        (a second session of the same token can be refused/flood-waited, which
+        used to leave the pool empty and every link request 'busy')."""
+        self._main = (client, bin_channel)
+        if not any(w.client is client for w in self.workers):
+            self.workers.insert(0, _Worker(client, bin_channel, owned=False))
+            logger.info("Fast-download pool: main bot client added as a stream worker")
+
+    async def _start_one(self, i: int, api_id: int, api_hash: str, token: str, bin_channel: int):
+        """Start one helper client; retries a couple of times (flood-waits, slow network)."""
+        last = None
+        for attempt in range(3):
             client = Client(
                 f"fastdl_{i}",
                 api_id=api_id,
@@ -183,11 +198,48 @@ class StreamPool:
             )
             try:
                 await client.start()
-            except Exception:
-                logger.exception("Stream client #%s failed to start — skipping it", i)
+                return _Worker(client, bin_channel)
+            except FloodWait as e:
+                last = e
+                wait = int(getattr(e, "value", 5) or 5)
+                logger.warning("Stream client #%s flood-waited %ss (try %s)", i, wait, attempt + 1)
+                await asyncio.sleep(min(wait, 30))
+            except Exception as e:
+                last = e
+                logger.warning("Stream client #%s failed to start (try %s): %r", i, attempt + 1, e)
+                await asyncio.sleep(2 * (attempt + 1))
+        logger.error("Stream client #%s could not start — skipping it (%r)", i, last)
+        return None
+
+    async def start(self, api_id: int, api_hash: str, tokens: list, bin_channel: int):
+        self._cfg = (api_id, api_hash, list(tokens), bin_channel)
+        seen = {w.client.bot_token for w in self.workers if getattr(w.client, "bot_token", None)}
+        for i, token in enumerate(tokens):
+            if not token or token in seen:
                 continue
-            self.workers.append(_Worker(client, bin_channel))
+            seen.add(token)
+            worker = await self._start_one(i, api_id, api_hash, token, bin_channel)
+            if worker:
+                self.workers.append(worker)
         logger.info("Fast-download pool ready with %s client(s)", len(self.workers))
+
+    async def ensure_workers(self) -> bool:
+        """Called when a link is requested and the pool is empty: try to bring
+        it back (at most once every 20 s) instead of failing every request."""
+        if self.workers:
+            return True
+        async with self._recover_lock:
+            if self.workers:
+                return True
+            if time.time() - self._last_recover < 20:
+                return False
+            self._last_recover = time.time()
+            logger.warning("Stream pool is empty — trying to bring it back")
+            if self._main:
+                self.add_main_client(*self._main)
+            if not self.workers and self._cfg:
+                await self.start(*self._cfg)
+            return bool(self.workers)
 
     async def stop(self):
         for w in self.workers:

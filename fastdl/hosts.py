@@ -62,15 +62,23 @@ async def _is_up(host: Host) -> bool:
 
 
 async def choose_host(size: int) -> Host | None:
-    for host in configured_hosts():
+    hosts = configured_hosts()
+    if not hosts:
+        logger.error("No stream host configured — set STREAM_BASE_URL (or ORACLE_STREAM_URL)")
+        return None
+    for host in hosts:
         if host.key == "local":
-            if not pool.workers:  # this process has no stream clients running
+            # This process must have stream clients running; if the pool is empty try to revive it.
+            if not pool.workers and not await pool.ensure_workers():
+                logger.error("Stream host 'local' skipped: no stream client is running "
+                             "(check the 'Stream client' / 'Fast-download pool' lines at boot)")
                 continue
         elif not await _is_up(host):
             continue
         used = await get_usage(host.key)
         if used + size > host.limit_bytes * STREAM_SWITCH_PERCENT / 100:
-            logger.info("Stream host %s is past %s%% of its monthly limit", host.key, STREAM_SWITCH_PERCENT)
+            logger.warning("Stream host %s skipped: month usage %.1f GB + file %.2f GB is past %s%% of its %.0f GB limit",
+                           host.key, used / GB, size / GB, STREAM_SWITCH_PERCENT, host.limit_bytes / GB)
             continue
         return host
     return None

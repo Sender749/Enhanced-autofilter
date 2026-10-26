@@ -19,6 +19,7 @@ Notes
   * First admin to press a button wins (atomic state change in Mongo).
   * /aliases lists aliases, /delalias <query> removes one.
 """
+import asyncio
 import html
 import logging
 
@@ -29,13 +30,14 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import ADMINS, NOT_FOUND_FILE_CHANNEL
 from database.alias_db import (
     alias_key, save_alias, delete_alias, list_aliases, transition,
-    find_waiting_by_reply, other_open_with_key, misses,
+    find_report, find_waiting_by_reply, other_open_with_key, misses,
 )
 from database.filters_db import (
     search_files, clean_title, display_name, parse_query, parse_tag_only_query,
 )
 
 logger = logging.getLogger(__name__)
+_BG: set = set()   # keeps fire-and-forget tasks alive until they finish
 
 HTML = enums.ParseMode.HTML
 ADMIN = filters.user(ADMINS)
@@ -83,6 +85,22 @@ async def _delete_quietly(bot, chat_id: int, *msg_ids):
         await bot.delete_messages(chat_id, ids)
     except RPCError:
         pass
+
+
+async def _notice(bot, text: str, seconds: int = 8):
+    """A short message in the channel that cleans itself up."""
+    try:
+        note = await bot.send_message(NOT_FOUND_FILE_CHANNEL, text)
+    except Exception:
+        return
+
+    async def _later():
+        await asyncio.sleep(seconds)
+        await _delete_quietly(bot, NOT_FOUND_FILE_CHANNEL, note.id)
+
+    task = asyncio.create_task(_later())
+    _BG.add(task)
+    task.add_done_callback(_BG.discard)
 
 
 def _done_text(doc: dict, target_title: str, note: str = "") -> str:
@@ -166,9 +184,29 @@ async def nf_buttons(bot, query):
 
 @Client.on_message(nf_channel_filter & filters.reply & filters.text, group=-2)
 async def nf_reply(bot, message):
-    doc = await find_waiting_by_reply(message.reply_to_message_id)
+    # This handler shares its group with the request-channel reply handler. A reply
+    # that is not about a not-found report must be PASSED ON (continue_propagation),
+    # otherwise whichever handler comes first swallows it and the other never runs.
+    if (message.text or "").lstrip().startswith("/"):
+        message.continue_propagation()
+    reply_id = message.reply_to_message_id
+    doc = await find_waiting_by_reply(reply_id)
     if not doc:
-        return  # an ordinary message in the channel — not ours
+        report = await find_report(reply_id)
+        if report is None:
+            message.continue_propagation()
+        if report["state"] == "open":
+            # Replying straight to an open report works like pressing Fix and then answering.
+            doc = await transition(str(report["_id"]), ["open"], "waiting")
+            if doc:
+                await _edit(bot, NOT_FOUND_FILE_CHANNEL, doc["chat_msg_id"],
+                            f"{doc['text']}\n\n↩️ <b>Reply to this message with the correct name.</b>",
+                            _waiting_markup(str(doc["_id"])))
+        if not doc:
+            states = {"done": "already fixed", "ignored": "ignored", "open": "being handled by another admin"}
+            await _notice(bot, f"ℹ️ That report is {states.get(report['state'], 'already handled')} — nothing changed.")
+            await _delete_quietly(bot, NOT_FOUND_FILE_CHANNEL, message.id)
+            message.stop_propagation()
     try:
         await _process_reply(bot, message, doc)
     finally:

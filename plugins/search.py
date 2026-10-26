@@ -415,6 +415,10 @@ def _search_filter(_, __, message):
     sender = message.from_user
     if message.outgoing or (sender and (sender.is_self or sender.is_bot)):
         return False
+    # The request / not-found channels are admin work areas. If one of them is a
+    # group, an admin's answer typed there ("Hindi Medium") must never start a search.
+    if message.chat.id in (REQUEST_CHANNEL, NOT_FOUND_FILE_CHANNEL):
+        return False
     if message.chat.type == enums.ChatType.PRIVATE:
         # Always let a DM query through to handle_search(): whether PM search is
         # ON or OFF is an admin switch (/settings -> PM Filter) checked there, so

@@ -11,6 +11,11 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserIsBlocked, RPCError
 
 from config import ADMINS, REQUEST_CHANNEL, MOVIE_GROUP_LINK
+from datetime import datetime, timezone
+
+from database.alias_db import alias_key, get_alias, save_alias
+from database.client import db
+from database.filters_db import clean_title, display_name, search_files
 from database.request_db import add_request
 from plugins.learn import note_request
 from database.settings_db import get_settings
@@ -34,6 +39,13 @@ async def _delete_later(message, seconds: int):
         await message.delete()
     except Exception:
         pass
+
+
+def _requested_raw(msg) -> str:
+    """The requested file name exactly as the user sent it (not HTML-escaped)."""
+    text = (getattr(msg, "text", None) or "").strip()
+    m = re.search(r"Query:\s*(.*?)\s*(?:\n\s*\nPlease check|$)", text, re.S)
+    return m.group(1).strip() if m else ""
 
 
 def _requested_name(msg) -> str:
@@ -384,6 +396,75 @@ async def _temp_notice(bot, chat_id, text: str, seconds: int = 10):
     task.add_done_callback(_bg_tasks.discard)
 
 
+# Unanswered prompts are ALSO kept in the database. They used to live only in
+# memory, so after a restart/redeploy an admin's answer to an older prompt was
+# silently ignored — the message just stayed there and nothing happened.
+_request_waits = db["request_waits"]
+_waits_indexed = False
+
+
+async def _save_wait(chat_id: int, prompt_id: int, store: dict, request_msg, data: dict):
+    global _waits_indexed
+    try:
+        if not _waits_indexed:
+            await _request_waits.create_index("created", expireAfterSeconds=7 * 86400, name="wait_ttl")
+            _waits_indexed = True
+        await _request_waits.update_one(
+            {"_id": f"{chat_id}:{prompt_id}"},
+            {"$set": {
+                "chat_id": chat_id, "prompt_id": prompt_id, "request_msg_id": request_msg.id,
+                "kind": "custom" if store is _CUSTOM_REPLY_WAIT else "wrong",
+                "user_id": data["user_id"], "msg_id": data.get("msg_id"),
+                "wrong_kind": data.get("kind"), "created": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+    except Exception:
+        logger.exception("Could not save the request prompt (it still works until the next restart)")
+
+
+async def _load_wait(chat_id: int, prompt_id: int):
+    try:
+        return await _request_waits.find_one({"_id": f"{chat_id}:{prompt_id}"})
+    except Exception:
+        return None
+
+
+async def _forget_wait(chat_id: int, prompt_id: int):
+    try:
+        await _request_waits.delete_one({"_id": f"{chat_id}:{prompt_id}"})
+    except Exception:
+        pass
+
+
+async def _saved_prompt_for(chat_id: int, request_msg_id: int, kind: str):
+    """prompt id of a saved (pre-restart) prompt for this request, or None."""
+    try:
+        doc = await _request_waits.find_one({"chat_id": chat_id, "request_msg_id": request_msg_id, "kind": kind})
+    except Exception:
+        return None
+    return doc["prompt_id"] if doc else None
+
+
+async def _learn_spelling(requested: str, correct: str):
+    """The admin gave the CORRECT spelling for a request. If that title exists in the
+    database, remember it: the next user who types the wrong spelling finds it
+    straight away. Returns the saved title, or None."""
+    try:
+        key, target_key = alias_key(requested), alias_key(correct)
+        if not key or not target_key or key == target_key or await get_alias(key):
+            return None
+        results = await search_files(correct, use_alias=False)
+        if not results:
+            return None
+        title = clean_title(display_name(results[0])) or correct
+        await save_alias(key, target_key, title, by="request-spelling")
+        return title
+    except Exception:
+        logger.exception("Could not save the corrected spelling as an alias")
+        return None
+
+
 async def _open_prompt(bot, store: dict, request_msg, text: str, cancel_data: str, data: dict):
     """Post a 'send me X' prompt under the request message and start waiting for
     the admin's reply. Any older prompt for the same request is removed first."""
@@ -397,12 +478,23 @@ async def _open_prompt(bot, store: dict, request_msg, text: str, cancel_data: st
                 except Exception:
                     pass
 
+    try:
+        async for old in _request_waits.find({"chat_id": chat_id, "request_msg_id": request_msg.id}):
+            try:
+                await bot.delete_messages(chat_id, old["prompt_id"])
+            except Exception:
+                pass
+            await _request_waits.delete_one({"_id": old["_id"]})
+    except Exception:
+        pass
+
     prompt = await bot.send_message(
         chat_id, text,
         reply_to_message_id=request_msg.id,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=cancel_data)]])
     )
     store[prompt.id] = {**data, "request_msg": request_msg, "prompt_id": prompt.id}
+    await _save_wait(chat_id, prompt.id, store, request_msg, data)
     while len(store) > _WAIT_LIMIT:
         store.pop(next(iter(store)))
     return prompt
@@ -454,9 +546,12 @@ async def cancel_wrong_callback(bot, query):
         return await query.answer("⚠️ Admin only!", show_alert=True)
     prompt_id = next((pid for pid, data in _WRONG_SPELL_WAIT.items() if data["request_msg"].id == req_msg_id), None)
     if not prompt_id:
+        prompt_id = await _saved_prompt_for(query.message.chat.id, req_msg_id, "wrong")
+    if not prompt_id:
         return await query.answer("Nothing to cancel", show_alert=True)
 
     _WRONG_SPELL_WAIT.pop(prompt_id, None)
+    await _forget_wait(query.message.chat.id, prompt_id)
     try:
         await query.message.delete()
     except Exception:
@@ -489,9 +584,12 @@ async def cancel_custom_callback(bot, query):
         return await query.answer("⚠️ Admin only!", show_alert=True)
     prompt_id = next((pid for pid, data in _CUSTOM_REPLY_WAIT.items() if data["request_msg"].id == req_msg_id), None)
     if not prompt_id:
+        prompt_id = await _saved_prompt_for(query.message.chat.id, req_msg_id, "custom")
+    if not prompt_id:
         return await query.answer("Nothing to cancel", show_alert=True)
 
     _CUSTOM_REPLY_WAIT.pop(prompt_id, None)
+    await _forget_wait(query.message.chat.id, prompt_id)
     try:
         await query.message.delete()
     except Exception:
@@ -607,12 +705,12 @@ async def _deliver(bot, user_id: int, text: str, markup) -> bool:
         return False
 
 
-async def _finish_request_message(bot, req_msg, label: str, alert_data: str):
+async def _finish_request_message(bot, req_msg, label: str, alert_data: str, note: str = ""):
     """Strike through the request and replace its buttons with a status button."""
     try:
         await bot.edit_message_text(
             req_msg.chat.id, req_msg.id,
-            f"<s>{html.escape(req_msg.text)}</s>",
+            f"<s>{html.escape(req_msg.text)}</s>" + note,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=alert_data)]])
         )
     except RPCError:
@@ -623,13 +721,33 @@ async def _finish_request_message(bot, req_msg, label: str, alert_data: str):
 async def handle_custom_reply_input(bot, message):
     """Handle the admin's custom reply / correct-spelling answer."""
     prompt_id = message.reply_to_message_id
+    if (message.text or "").lstrip().startswith("/"):
+        message.continue_propagation()
+    saved = None
     if prompt_id not in _CUSTOM_REPLY_WAIT and prompt_id not in _WRONG_SPELL_WAIT:
-        return      # ordinary message in the channel - not ours
+        saved = await _load_wait(message.chat.id, prompt_id)   # a prompt from before a restart
+        if not saved:
+            message.continue_propagation()   # ordinary message - hand it to the next handler
     if not await _sender_is_admin(bot, message):
-        return
+        message.continue_propagation()
 
     try:
+        if saved:
+            try:
+                req_msg = await bot.get_messages(message.chat.id, saved["request_msg_id"])
+            except Exception:
+                req_msg = None
+            if not req_msg or getattr(req_msg, "empty", False) or not getattr(req_msg, "text", None):
+                await _forget_wait(message.chat.id, prompt_id)
+                await _temp_notice(bot, message.chat.id, "⚠️ The original request message is gone, so this reply can't be used.")
+                return
+            store = _CUSTOM_REPLY_WAIT if saved["kind"] == "custom" else _WRONG_SPELL_WAIT
+            store[prompt_id] = {"user_id": saved["user_id"], "msg_id": saved.get("msg_id"),
+                                "kind": saved.get("wrong_kind") or "uploaded",
+                                "request_msg": req_msg, "prompt_id": prompt_id}
         typed = message.text.strip()
+
+        spelling_note = ""
 
         # ── custom reply ────────────────────────────────────────────────
         if prompt_id in _CUSTOM_REPLY_WAIT:
@@ -665,6 +783,10 @@ async def handle_custom_reply_input(bot, message):
             )
             status_label = "✅ Uploaded, Spelling ✏️" if is_uploaded else "🫤 Available, Spelling ✏️"
             alert = f"ulws_alert#{user_id}"
+            learned = await _learn_spelling(_requested_raw(req_msg), typed)
+            if learned:
+                spelling_note = (f"\n\n✅ Saved: <code>{html.escape(_requested_raw(req_msg))}</code> → "
+                                 f"<b>{html.escape(learned)}</b> (search alias)")
 
         # Clean the channel: remove the admin's typed reply and the bot's prompt.
         try:
@@ -672,7 +794,8 @@ async def handle_custom_reply_input(bot, message):
         except Exception:
             pass
 
-        await _finish_request_message(bot, req_msg, status_label, alert)
+        await _forget_wait(message.chat.id, prompt_id)
+        await _finish_request_message(bot, req_msg, status_label, alert, spelling_note)
 
         if not delivered:
             await _temp_notice(

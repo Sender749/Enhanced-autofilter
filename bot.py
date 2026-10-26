@@ -101,11 +101,13 @@ class Bot(Client):
         start_learning(self)  # AI learning loop (does nothing while switched off in /settings)
 
         if FASTDL_SERVER_ENABLED:
-            # Second session of the main token + any helper bots, download-only.
+            # The running main bot is the first stream worker (no second login with the same
+            # token), then any helper bots are started on top, download-only.
+            stream_pool.add_main_client(self, BIN_CHANNEL)
             try:
-                await stream_pool.start(API_ID, API_HASH, [BOT_TOKEN] + HELPER_BOT_TOKENS, BIN_CHANNEL)
+                await stream_pool.start(API_ID, API_HASH, list(HELPER_BOT_TOKENS), BIN_CHANNEL)
             except Exception:
-                logger.exception("Fast-download pool failed to start — bot continues without it")
+                logger.exception("Helper stream bots failed to start — the main bot still streams")
 
         if FASTDL_ENABLED:
             logger.info("Fast Download is ON (hosts: %s)",

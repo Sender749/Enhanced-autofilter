@@ -83,12 +83,20 @@ async def _log_user_in_bin(bot, entry: dict, doc: dict, user):
             user_id=user.id,
             user_link=user_link,
         )
-        await bot.send_message(
-            BIN_CHANNEL, text,
-            reply_to_message_id=entry["bin_msg_id"],
-            parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        try:
+            await bot.send_message(
+                BIN_CHANNEL, text,
+                reply_to_message_id=entry["bin_msg_id"],
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except RPCError:
+            # The file copy may have been deleted from the channel — still keep the log line.
+            await bot.send_message(
+                BIN_CHANNEL, text,
+                parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
     except Exception:
         logger.warning("Couldn't post user info to BIN_CHANNEL", exc_info=True)
 
@@ -119,6 +127,8 @@ async def _generate(bot, query, file_id: str, user, key):
         size = int(entry.get("size") or 0)
         host = await choose_host(size)
         if not host:
+            logger.error("Fast download: no stream host available for file %s (user %s) — see the lines above",
+                         file_id, user.id)
             await _fail(query, FAST_UNAVAILABLE_TXT)
             return
 

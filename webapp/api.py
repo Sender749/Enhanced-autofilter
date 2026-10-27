@@ -26,9 +26,9 @@ from config import (
 from database.filters_db import get_file_by_id, display_name
 from database.premium_db import has_premium_access
 from database.request_db import add_request
-from database.stream_db import get_bin_entry, add_usage, get_daily, increment_daily
+from database.stream_db import get_bin_entry, get_daily, increment_daily
 from database import trending_db
-from fastdl.hosts import choose_host
+from fastdl.hosts import choose_host, note_link_issued
 from fastdl.links import build_url, is_video
 from utils import temp
 from webapp.auth import validate_init_data
@@ -369,7 +369,7 @@ async def link(request):
             "stream": f"{host.base_url}/stream/{token}/{qname}" if video else None,
             "watch": f"{host.base_url}/watch/{token}/{qname}" if video else None,
         }
-        await add_usage(host.key, size)
+        await note_link_issued(host, size)
         await increment_daily(user["id"])
         u = SimpleNamespace(id=user["id"], first_name=user.get("first_name", ""), last_name=user.get("last_name", ""),
                             username=user.get("username"))

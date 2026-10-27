@@ -26,9 +26,9 @@ from config import (
 from database.filters_db import get_file_by_id, display_name
 from database.premium_db import has_premium_access
 from database.stream_db import (
-    get_bin_entry, save_bin_entry, add_usage, get_daily, increment_daily,
+    get_bin_entry, save_bin_entry, get_daily, increment_daily,
 )
-from fastdl.hosts import choose_host
+from fastdl.hosts import choose_host, note_link_issued
 from fastdl.links import build_url, is_video, ready_markup
 from strings import (
     FILE_NOT_FOUND_TXT, FAST_GENERATING_TXT, FAST_LIMIT_REACHED_TXT,
@@ -141,7 +141,7 @@ async def _generate(bot, query, file_id: str, user, key):
             watch_url = f"{host.base_url}/watch/{token}/{url.rsplit('/', 1)[1]}"
 
         await query.message.edit_reply_markup(ready_markup(url, watch_url))
-        await add_usage(host.key, size)
+        await note_link_issued(host, size)
         await increment_daily(user.id)
         await _log_user_in_bin(bot, entry, doc, user)
     except Exception:

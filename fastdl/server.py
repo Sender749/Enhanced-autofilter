@@ -9,15 +9,17 @@ import asyncio
 import html
 import logging
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from aiohttp import web
 
 from config import (
     STREAM_SECRET, STREAM_PREFETCH, STREAM_MAX_CONNECTIONS, STREAM_MAX_PER_LINK,
+    STREAM_ONLY, STREAM_FALLBACK_URL,
 )
 from fastdl.pool import NotFound, pool
 from fastdl.tokens import verify_token
+from fastdl.usage import counter, HOST_KEY, _month
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,19 @@ _EXPIRED_HTML = (
     "<h3>⏳ This download link has expired</h3>"
     "<p>Go back to the bot and request the file again to get a fresh link.</p></body>"
 )
+
+
+def _fallback_redirect(request: web.Request):
+    """Oracle server only, and only if STREAM_FALLBACK_URL is set: when this server can't stream
+    (its clients are down / Telegram unreachable) send the SAME path + token to the backup host.
+    Tokens carry no host name, so the backup accepts them as they are."""
+    if not (STREAM_ONLY and STREAM_FALLBACK_URL):
+        return None
+    if urlsplit(STREAM_FALLBACK_URL).netloc == request.host:  # never redirect to ourselves
+        return None
+    logger.warning("Redirecting %s to the fallback host", request.path[:60])
+    return web.Response(status=302, headers={"Location": STREAM_FALLBACK_URL + request.raw_path,
+                                             "Cache-Control": "no-store"})
 
 
 def parse_range(header: str | None, size: int):
@@ -78,16 +93,16 @@ async def _serve(request: web.Request, inline: bool):
     msg_id, _user_id, _exp = parsed
 
     if not pool.workers:
-        return web.Response(text="Server is starting, try again in a moment.", status=503,
-                            headers={"Retry-After": "10"})
+        return _fallback_redirect(request) or web.Response(
+            text="Server is starting, try again in a moment.", status=503, headers={"Retry-After": "10"})
     try:
         meta = await pool.meta(msg_id)
     except NotFound:
         return web.Response(text="File not found.", status=404)
     except Exception:
         logger.exception("meta lookup failed for msg %s", msg_id)
-        return web.Response(text="Couldn't reach Telegram, try again.", status=503,
-                            headers={"Retry-After": "5"})
+        return _fallback_redirect(request) or web.Response(
+            text="Couldn't reach Telegram, try again.", status=503, headers={"Retry-After": "5"})
 
     size = meta.size
     if size <= 0:
@@ -133,6 +148,7 @@ async def _serve(request: web.Request, inline: bool):
         try:
             async for data in pool.iter_range(msg_id, start, end, STREAM_PREFETCH):
                 await resp.write(data)
+                counter.record(len(data))  # real bytes sent -> monthly bandwidth counter
             await resp.write_eof()
         except (ConnectionResetError, ConnectionError):
             pass  # user closed the tab / paused the download — normal
@@ -175,6 +191,10 @@ async def handle_watch(request: web.Request):
     token = request.match_info["token"]
     if not verify_token(STREAM_SECRET, token):
         return web.Response(text=_EXPIRED_HTML, status=403, content_type="text/html")
+    if not pool.workers:
+        redirect = _fallback_redirect(request)
+        if redirect:
+            return redirect
     name = request.match_info.get("name") or "video"
     base = f"{request.scheme}://{request.host}"
     # Behind Caddy / Render / Koyeb the browser-facing scheme is https.
@@ -194,7 +214,16 @@ async def handle_watch(request: web.Request):
 
 
 async def handle_health(_request: web.Request):
-    return web.Response(text="ok")
+    """The bot probes this on the Oracle host: 'workers' says whether it can stream right now,
+    'bytes' is the real number of bytes it has sent this month."""
+    try:
+        used = await counter.month_bytes()
+    except Exception:
+        used = None
+    body = {"ok": True, "host": HOST_KEY, "workers": len(pool.workers), "month": _month()}
+    if used is not None:
+        body["bytes"] = used
+    return web.json_response(body)
 
 
 def register_routes(app: web.Application):

@@ -23,6 +23,7 @@ from log_utils import schedule_restart_notice
 from utils import temp
 from web import web_app
 from fastdl.pool import pool as stream_pool
+from fastdl.usage import counter as usage_counter
 import styled_buttons
 
 logging.basicConfig(
@@ -108,6 +109,7 @@ class Bot(Client):
                 await stream_pool.start(API_ID, API_HASH, list(HELPER_BOT_TOKENS), BIN_CHANNEL)
             except Exception:
                 logger.exception("Helper stream bots failed to start — the main bot still streams")
+            await usage_counter.start()  # saves real bytes sent to MongoDB every 15 s
 
         if FASTDL_ENABLED:
             logger.info("Fast Download is ON (hosts: %s)",
@@ -144,6 +146,7 @@ class Bot(Client):
                 logger.warning("Couldn't set the admin command menu for %s", admin_id, exc_info=True)
 
     async def stop(self, *args):
+        await usage_counter.stop()
         await stream_pool.stop()
         await super().stop()
         logger.info("Bot stopped.")

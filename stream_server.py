@@ -20,6 +20,7 @@ from aiohttp import web
 from config import API_ID, API_HASH, BOT_TOKEN, BIN_CHANNEL, STREAM_SECRET, HELPER_BOT_TOKENS, PORT
 from fastdl.pool import pool
 from fastdl.server import register_routes
+from fastdl.usage import counter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -37,6 +38,7 @@ async def main():
     if not pool.workers:
         raise SystemExit("No stream client could start — check the bot tokens.")
 
+    await counter.start()  # real bytes sent -> STREAM_USAGE_FILE, reported to the bot via /health
     app = web.Application()
     app.add_routes([web.get("/", lambda _: web.Response(text="ok"))])
     register_routes(app)

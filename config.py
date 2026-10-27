@@ -121,6 +121,17 @@ STREAM_BANDWIDTH_LIMIT_GB = float(os.environ.get("STREAM_BANDWIDTH_LIMIT_GB", "1
 ORACLE_STREAM_URL = os.environ.get("ORACLE_STREAM_URL", "").strip().rstrip("/")
 ORACLE_BANDWIDTH_LIMIT_GB = float(os.environ.get("ORACLE_BANDWIDTH_LIMIT_GB", "10000"))
 
+# Failover tuning — every one of these is optional.
+STREAM_HEALTH_TIMEOUT = float(os.environ.get("STREAM_HEALTH_TIMEOUT", "2.5"))   # seconds for the Oracle /health probe
+# Set on the ORACLE server only: when its own stream clients are down it 302-redirects /dl, /stream
+# and /watch (same token) to this URL, e.g. your Koyeb app. Empty = redirect OFF.
+STREAM_FALLBACK_URL = os.environ.get("STREAM_FALLBACK_URL", "").strip().rstrip("/")
+# Oracle server only: where it saves its real monthly byte counter (it has no database).
+STREAM_USAGE_FILE = os.environ.get("STREAM_USAGE_FILE", "stream_usage.json").strip()
+# Bot/Koyeb only: GB already used this month before real counting began. Optional, set it once
+# (e.g. from Koyeb's usage CSV) and remove it next month. 0 = off.
+STREAM_LOCAL_BASELINE_GB = float(os.environ.get("STREAM_LOCAL_BASELINE_GB", "0") or 0)
+
 # Move new links to the next host once a host passes this % of its monthly limit.
 STREAM_SWITCH_PERCENT = int(os.environ.get("STREAM_SWITCH_PERCENT", "85"))
 STREAM_LINK_TTL_HOURS = int(os.environ.get("STREAM_LINK_TTL_HOURS", "6"))

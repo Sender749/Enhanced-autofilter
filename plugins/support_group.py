@@ -43,7 +43,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import (
     ADMINS, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK,
     GROQ_API_KEY, GROQ_MODEL, GEMINI_API_KEY, GEMINI_MODEL, AI_FETCH_TIMEOUT,
-    is_support_chat,
+    is_support_chat, SUPPORT_REPORT_ALL,
 )
 from database.client import db
 from database.filters_db import search_files
@@ -95,7 +95,14 @@ _AI_PROMPT = (
     "If the message could be several titles, or the title is unclear, give 50 or less.\n"
     "- is_title is false for greetings, thanks, complaints, questions about the bot, premium, payments, "
     "general chat, or when no title is named. Then title is empty.\n"
-    "- If several different titles are named, use the first one and give confidence 50 or less.\n\n"
+    "- If several different titles are named, use the first one and give confidence 50 or less.\n"
+    "- Users add extra words around the title: bro, bhai, sir, pls, full, all episodes, complete, season N, "
+    "hindi, 1080p, link, upload kar do. Drop them from the title; use them only for season / year.\n\n"
+    "Examples:\n"
+    "\"Bro moon knight\" -> {\"is_title\": true, \"title\": \"Moon Knight\", \"year\": \"\", \"season\": null, \"language\": \"\", \"confidence\": 90}\n"
+    "\"Dupahiya season 2 Full episodes\" -> {\"is_title\": true, \"title\": \"Dupahiya\", \"year\": \"\", \"season\": 2, \"language\": \"\", \"confidence\": 85}\n"
+    "\"Dopahiya season 1\" -> {\"is_title\": true, \"title\": \"Dupahiya\", \"year\": \"\", \"season\": 1, \"language\": \"\", \"confidence\": 70}\n"
+    "\"bot kaam nahi kar raha\" -> {\"is_title\": false, \"title\": \"\", \"year\": \"\", \"season\": null, \"language\": \"\", \"confidence\": 95}\n\n"
     "Message: "
 )
 
@@ -144,11 +151,12 @@ async def _ask_groq(prompt: str):
             async with session.post("https://api.groq.com/openai/v1/chat/completions", json=payload,
                                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"}) as r:
                 if r.status != 200:
+                    logger.warning("Groq title detection: HTTP %s %s", r.status, (await r.text())[:200])
                     return None
                 data = await r.json()
         return _parse_ai(data["choices"][0]["message"]["content"])
     except Exception:
-        logger.debug("Groq title detection failed", exc_info=True)
+        logger.warning("Groq title detection failed", exc_info=True)
         return None
 
 
@@ -164,11 +172,12 @@ async def _ask_gemini(prompt: str):
             async with session.post(url, json=payload, headers={
                     "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}) as r:
                 if r.status != 200:
+                    logger.warning("Gemini title detection: HTTP %s %s", r.status, (await r.text())[:200])
                     return None
                 data = await r.json()
         return _parse_ai(data["candidates"][0]["content"]["parts"][0]["text"])
     except Exception:
-        logger.debug("Gemini title detection failed", exc_info=True)
+        logger.warning("Gemini title detection failed", exc_info=True)
         return None
 
 
@@ -263,6 +272,88 @@ async def resolve(title: str, year: str = "", season=None) -> dict:
     return {"state": "found", "results": results, "via": via}
 
 
+# ── Extra words around the title ("Bro moon knight", "Dupahiya season 2 Full episodes") ──
+
+_FILLER = {
+    "bro", "bhai", "bhaiya", "sir", "sis", "dude", "yaar", "pls", "plz", "please", "pleaseee", "hi", "hello", "hey",
+    "full", "complete", "all", "every", "episode", "episodes", "ep", "eps", "season", "seasons", "series", "web",
+    "movie", "movies", "film", "show", "hindi", "dubbed", "dual", "audio", "english", "hd", "link", "links",
+    "send", "give", "dedo", "do", "de", "chahiye", "chahie", "hai", "he", "h", "kya", "ka", "ki", "ke", "ko", "me",
+    "mein", "upload", "uploaded", "kar", "karo", "krdo", "kardo", "download", "want", "need", "available", "watch",
+    "the", "a", "an", "of", "in", "is", "any", "one", "new", "latest", "mujhe", "muje", "aap", "app", "bot",
+}
+
+
+def _local_candidates(text: str):
+    """-> (candidate titles, season or None) built only from the user's own words:
+    filler / season words removed, then the whole phrase and its shorter word windows."""
+    t = text.lower()
+    season = None
+    m = re.search(r"\bseason\s*0*(\d{1,2})\b", t) or re.search(r"\bs0*(\d{1,2})\b", t)
+    if m:
+        season = int(m.group(1))
+        t = t[:m.start()] + " " + t[m.end():]
+    words = [w for w in re.findall(r"[^\W_]+", t) if w not in _FILLER and not re.fullmatch(r"\d{3,4}p", w)]
+    if not words:
+        return [], season
+    cands = [" ".join(words)]
+    n = len(words)
+    for size in range(n - 1, 1, -1):          # windows of 2+ words only (a single word is too risky)
+        for i in range(0, n - size + 1):
+            cands.append(" ".join(words[i:i + size]))
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:10], season
+
+
+async def _quick_exact(title: str, season=None):
+    """Cheap exact-title check used for the shorter word windows."""
+    results = await search_files(f"{title} s{int(season):02d}" if season else title) or await search_files(title)
+    if not results:
+        return None
+    return await _exact_title_files(title, results)
+
+
+async def resolve_message(ai: dict | None, text: str) -> dict:
+    """Look the message up: the AI's title first, then the user's own words with the filler removed.
+    -> resolve() dict, plus "title" (what matched)."""
+    ai_title = (ai or {}).get("title", "")
+    year = (ai or {}).get("year", "")
+    ai_season = (ai or {}).get("season")
+    best = {"state": "none", "results": [], "via": "exact", "title": ai_title}
+
+    if ai_title:
+        best = await resolve(ai_title, year, ai_season)
+        best["title"] = ai_title
+        if best["state"] == "found":
+            return best
+
+    cands, local_season = _local_candidates(text)
+    season = ai_season or local_season
+    for i, cand in enumerate(cands):
+        if cand.lower() == ai_title.lower():
+            continue
+        if i == 0:
+            loc = await resolve(cand, "", season)
+        else:
+            files = await _quick_exact(cand, season)
+            loc = {"state": "found", "results": files, "via": "local"} if files else {"state": "none", "results": []}
+            if files and season and not any(
+                    extract_media_info(f.get("file_name", ""), _plain(f.get("caption", "") or ""))["season"] == int(season)
+                    for f in files):
+                loc["state"] = "partial"
+        if loc["state"] in ("found", "partial") and loc["results"]:
+            loc["title"] = cand
+            if loc["state"] == "found" or best["state"] not in ("found", "partial"):
+                best = loc
+            if loc["state"] == "found":
+                return best
+    return best
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # The "already uploaded" card (same look as the movie update message)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,7 +380,7 @@ def _getfiles_query(title: str) -> str:
     return out
 
 
-async def build_card(results: list, fallback_title: str, header: str):
+async def build_card(results: list, fallback_title: str, header: str, query: str | None = None):
     """-> (caption text, poster dict or None, InlineKeyboardMarkup)"""
     dtitle, dyear, _hint = _pick_title_from_results(results)
     title = dtitle or fallback_title
@@ -359,7 +450,7 @@ async def build_card(results: list, fallback_title: str, header: str):
     if len(text) > CAPTION_LIMIT:
         text = text[:CAPTION_LIMIT - 1]
 
-    query = _getfiles_query(title)
+    query = _getfiles_query(query or title)
     link = f"https://t.me/{temp.U_NAME}?start=getfile-{query}" if query else f"https://t.me/{temp.U_NAME}"
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 ɢᴇᴛ ꜰɪʟᴇs", url=link)]])
     return text, poster, markup
@@ -393,7 +484,8 @@ async def _send_card(bot, chat_id: int, reply_to, user_id: int, name: str, resul
 # Reports for admins (#FILE_NOT_FOUND channel)
 # ══════════════════════════════════════════════════════════════════════════════
 
-OPEN, WAIT_SP, WAIT_CU, DONE, IGNORED = "open", "waiting_sp", "waiting_cu", "done", "ignored"
+OPEN, WAIT_SP, WAIT_CU, WAIT_QRY, DONE, IGNORED = "open", "waiting_sp", "waiting_cu", "waiting_qry", "done", "ignored"
+WAITING = [WAIT_SP, WAIT_CU, WAIT_QRY]
 
 
 def _oid(value):
@@ -440,6 +532,13 @@ def _open_markup(ask_id) -> InlineKeyboardMarkup:
 
 def _cancel_markup(ask_id) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"sga#cn#{ask_id}")]])
+
+
+def _query_markup(ask_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭ Use default", callback_data=f"sga#df#{ask_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"sga#cn#{ask_id}"),
+    ]])
 
 
 async def _edit(bot, doc: dict, text: str, markup=None):
@@ -504,7 +603,7 @@ async def _create_ask(bot, message, ai, reason: str):
     text = message.text.strip()
     # The same person asking the same thing again while it is still open: one report is enough.
     dup = await asks.find_one({"chat_id": message.chat.id, "user_id": user.id, "text": text,
-                               "state": {"$in": [OPEN, WAIT_SP, WAIT_CU]}})
+                               "state": {"$in": [OPEN] + WAITING}})
     if dup:
         return
     try:
@@ -533,52 +632,102 @@ async def _create_ask(bot, message, ai, reason: str):
 
 # ── what the user is told ───────────────────────────────────────────────────
 
-async def _relay_uploaded(bot, doc: dict, now: bool):
-    """Admin said 'already uploaded' / 'now uploaded'. If the AI's title is confident and the files
-    are in the database the full card is sent, otherwise a short text with the main group button."""
-    title = doc.get("title") if doc.get("confidence", 0) >= CONF_MIN else ""
-    label = "🆕 ɴᴏᴡ ᴜᴘʟᴏᴀᴅᴇᴅ" if now else "✅ ᴀʟʀᴇᴀᴅʏ ᴜᴘʟᴏᴀᴅᴇᴅ"
-    if title:
-        try:
-            loc = await resolve(title, doc.get("year", ""), doc.get("season"))
-        except Exception:
-            logger.exception("Lookup failed while answering the support group")
-            loc = {"state": "none", "results": []}
-        if loc["state"] in ("found", "partial") and loc["results"]:
-            header = f"{_mention(doc['user_id'], doc.get('user_name'))} 👋\n<b>{label}</b>\n\n"
-            text, poster, markup = await build_card(loc["results"], title, header)
-            return await _send(bot, doc["chat_id"], doc["msg_id"], text, markup, poster["url"] if poster else None)
-    what = f"<b>{html.escape(title)}</b>" if title else "the movie / series you asked for"
-    text = (f"{_mention(doc['user_id'], doc.get('user_name'))} 👋\n<b>{label}</b>\n\n"
-            f"{what} is available. Please send its <b>name</b> in the main group 👇")
-    return await _send(bot, doc["chat_id"], doc["msg_id"], text, _main_group_markup())
+LABELS = {"up": "✅ ᴀʟʀᴇᴀᴅʏ ᴜᴘʟᴏᴀᴅᴇᴅ", "nw": "🆕 ɴᴏᴡ ᴜᴘʟᴏᴀᴅᴇᴅ"}
+RESULT_TEXT = {"up": "✅ Already uploaded", "nw": "🆕 Now uploaded", "sp": "✏️ Spelling mistake", "cu": "💬 Custom message"}
 
 
-async def _relay_spelling(bot, doc: dict, spelling: str):
-    name = _mention(doc["user_id"], doc.get("user_name"))
+def _default_query(doc: dict) -> str:
+    """What the Get Files button searches when the admin presses 'Use default'."""
+    return doc.get("spelling") or doc.get("title") or ""
+
+
+def _files_markup(query: str, with_group: bool = True):
+    rows = []
+    q = _getfiles_query(query or "")
+    if q:
+        rows.append([InlineKeyboardButton("🔍 ɢᴇᴛ ꜰɪʟᴇs", url=f"https://t.me/{temp.U_NAME}?start=getfile-{q}")])
+    if with_group and MOVIE_GROUP_LINK:
+        rows.append([InlineKeyboardButton("🎬 Open Main Group", url=MOVIE_GROUP_LINK)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _card_or_none(bot, doc: dict, query: str, header: str):
+    """Full card when the query is in the database, else None."""
+    if not query:
+        return None
     try:
-        loc = await resolve(spelling)
+        loc = await resolve(query)
     except Exception:
-        loc = {"state": "none", "results": []}
-    if loc["state"] == "found" and loc["results"]:
-        header = (f"{name} 👋\n<b>✏️ ʏᴏᴜʀ sᴘᴇʟʟɪɴɢ ᴡᴀs ᴡʀᴏɴɢ</b>\n"
-                  f"✅ ᴀʟʀᴇᴀᴅʏ ᴜᴘʟᴏᴀᴅᴇᴅ — ᴄᴏʀʀᴇᴄᴛ ɴᴀᴍᴇ: <b>{html.escape(spelling)}</b>\n\n")
-        text, poster, markup = await build_card(loc["results"], spelling, header)
+        logger.exception("Lookup failed while answering the support group")
+        return None
+    if loc["state"] in ("found", "partial") and loc["results"]:
+        text, poster, markup = await build_card(loc["results"], query, header, query=query)
         return await _send(bot, doc["chat_id"], doc["msg_id"], text, markup, poster["url"] if poster else None)
-    text = (f"{name} 👋\n<b>✏️ ʏᴏᴜʀ sᴘᴇʟʟɪɴɢ ɪs ᴡʀᴏɴɢ</b>\n\n"
-            f"Correct name: <b>{html.escape(spelling)}</b>\n"
-            "Please send this name in the main group 👇")
-    return await _send(bot, doc["chat_id"], doc["msg_id"], text, _main_group_markup())
+    return None
 
 
-async def _relay_custom(bot, doc: dict, custom: str):
-    text = f"{_mention(doc['user_id'], doc.get('user_name'))} 👋\n\n{html.escape(custom)}"
-    return await _send(bot, doc["chat_id"], doc["msg_id"], text)
+async def _relay(bot, doc: dict, query: str):
+    """The admin's decision (doc['action']) is sent to the support group; `query` feeds Get Files."""
+    action = doc["action"]
+    name = _mention(doc["user_id"], doc.get("user_name"))
+
+    if action in ("up", "nw"):
+        header = f"{name} 👋\n<b>{LABELS[action]}</b>\n\n"
+        sent = await _card_or_none(bot, doc, query, header)
+        if sent:
+            return sent
+        what = f"<b>{html.escape(query)}</b>" if query else "the movie / series you asked for"
+        text = f"{header}{what} is available. Tap the button below 👇"
+        return await _send(bot, doc["chat_id"], doc["msg_id"], text, _files_markup(query))
+
+    if action == "sp":
+        spelling = doc.get("spelling", "")
+        header = (f"{name} 👋\n<b>✏️ ʏᴏᴜʀ sᴘᴇʟʟɪɴɢ ɪs ᴡʀᴏɴɢ</b>\n"
+                  f"ᴄᴏʀʀᴇᴄᴛ ɴᴀᴍᴇ: <b>{html.escape(spelling)}</b>\n\n")
+        sent = await _card_or_none(bot, doc, query, header)
+        if sent:
+            return sent
+        text = header + "Tap the button below, or send this name in the main group 👇"
+        return await _send(bot, doc["chat_id"], doc["msg_id"], text, _files_markup(query))
+
+    # custom message
+    text = f"{name} 👋\n\n{html.escape(doc.get('custom', ''))}"
+    return await _send(bot, doc["chat_id"], doc["msg_id"], text, _files_markup(query, with_group=False))
+
+
+async def _finish(bot, doc: dict, query: str):
+    """Final step: send to the support group and close the report."""
+    sent = await _relay(bot, doc, query)
+    label = RESULT_TEXT[doc["action"]]
+    if doc["action"] == "sp":
+        label += f" → <code>{html.escape(doc.get('spelling', ''))}</code>"
+    q = f" · 🔍 <code>{html.escape(query)}</code>" if query else " · no Get Files button"
+    tail = "sent to the support group" if sent else "⚠️ could not post in the support group"
+    await _delete_quietly(bot, doc.get("prompt_id"))
+    await _edit(bot, doc, f"{_report_text(doc)}\n\n<b>{label}</b>{q} — {tail}.")
+    if not sent:
+        await _notice(bot, "⚠️ Couldn't post in the support group. Is the bot still an admin there?")
+
+
+async def _ask_query(bot, doc: dict):
+    """Ask the admin which words the Get Files button should search."""
+    default = _default_query(doc)
+    hint = f"\nDefault: <code>{html.escape(default)}</code>" if default else "\nNo default — Use default sends no button."
+    try:
+        prompt = await bot.send_message(
+            NOT_FOUND_FILE_CHANNEL,
+            "🔍 Reply to this message with the <b>search query</b> for the Get Files button "
+            "(what the user will see when they tap it)." + hint,
+            parse_mode=HTML, reply_to_message_id=doc["nf_msg_id"], reply_markup=_query_markup(str(doc["_id"])))
+        await asks.update_one({"_id": doc["_id"]}, {"$set": {"prompt_id": prompt.id}})
+    except Exception:
+        logger.exception("Could not post the query prompt")
+    await _edit(bot, doc, f"{_report_text(doc)}\n\n⏳ <i>Waiting for the search query…</i>", _query_markup(str(doc["_id"])))
 
 
 # ── buttons ─────────────────────────────────────────────────────────────────
 
-@Client.on_callback_query(filters.regex(r"^sga#(up|nw|sp|cu|ig|cn)#"))
+@Client.on_callback_query(filters.regex(r"^sga#(up|nw|sp|cu|ig|cn|df)#"))
 async def support_buttons(bot, query):
     if query.from_user.id not in ADMINS:
         await query.answer("Admins only.", show_alert=True)
@@ -588,19 +737,15 @@ async def support_buttons(bot, query):
     handled = "Already handled by another admin."
 
     if action in ("up", "nw"):
-        doc = await _transition(ask_id, [OPEN], DONE, {"result": "uploaded" if action == "up" else "now"})
+        doc = await _transition(ask_id, [OPEN], WAIT_QRY, {"action": action})
         if not doc:
             return await query.answer(handled, show_alert=True)
-        await query.answer("Sending to the support group…")
-        sent = await _relay_uploaded(bot, doc, now=(action == "nw"))
-        label = "✅ Already uploaded" if action == "up" else "🆕 Now uploaded"
-        tail = "sent to the support group" if sent else "⚠️ could not post in the support group"
-        await _edit(bot, doc, f"{_report_text(doc)}\n\n<b>{label}</b> — {tail}.")
-        return
+        await query.answer("Reply with the search query.")
+        return await _ask_query(bot, doc)
 
     if action in ("sp", "cu"):
         waiting = WAIT_SP if action == "sp" else WAIT_CU
-        doc = await _transition(ask_id, [OPEN], waiting)
+        doc = await _transition(ask_id, [OPEN], waiting, {"action": action})
         if not doc:
             return await query.answer(handled, show_alert=True)
         what = "the <b>correct spelling</b>" if action == "sp" else "your <b>custom message</b>"
@@ -614,16 +759,24 @@ async def support_buttons(bot, query):
         await _edit(bot, doc, f"{_report_text(doc)}\n\n⏳ <i>Waiting for an admin's reply…</i>", _cancel_markup(ask_id))
         return await query.answer("Reply to the message in the channel.")
 
+    if action == "df":
+        doc = await _transition(ask_id, [WAIT_QRY], DONE)
+        if not doc:
+            return await query.answer(handled, show_alert=True)
+        await query.answer("Sending…")
+        return await _finish(bot, doc, _default_query(doc))
+
     if action == "cn":
-        doc = await _transition(ask_id, [WAIT_SP, WAIT_CU], OPEN)
+        doc = await _transition(ask_id, WAITING, OPEN)
         if not doc:
             return await query.answer(handled, show_alert=True)
         await _delete_quietly(bot, doc.get("prompt_id"))
+        await asks.update_one({"_id": doc["_id"]}, {"$unset": {"action": "", "spelling": "", "custom": "", "prompt_id": ""}})
         await _edit(bot, doc, _report_text(doc), _open_markup(ask_id))
         return await query.answer("Cancelled.")
 
     if action == "ig":
-        doc = await _transition(ask_id, [OPEN, WAIT_SP, WAIT_CU], IGNORED)
+        doc = await _transition(ask_id, [OPEN] + WAITING, IGNORED)
         if not doc:
             return await query.answer(handled, show_alert=True)
         await _delete_quietly(bot, doc.get("prompt_id"))
@@ -631,7 +784,7 @@ async def support_buttons(bot, query):
         return await query.answer("Ignored.")
 
 
-# ── the admin's reply in the channel (spelling / custom message) ────────────
+# ── the admin's reply in the channel (spelling / custom text / search query) ──
 
 def _is_nf_channel(_, __, message) -> bool:
     return bool(NOT_FOUND_FILE_CHANNEL) and message.chat is not None and message.chat.id == NOT_FOUND_FILE_CHANNEL
@@ -655,28 +808,34 @@ async def support_admin_reply(bot, message):
     if (message.text or "").lstrip().startswith("/") or _is_own_message(message):
         message.continue_propagation()
     rid = message.reply_to_message_id
-    doc = await asks.find_one({"state": {"$in": [WAIT_SP, WAIT_CU]},
-                               "$or": [{"nf_msg_id": rid}, {"prompt_id": rid}]})
+    doc = await asks.find_one({"state": {"$in": WAITING}, "$or": [{"nf_msg_id": rid}, {"prompt_id": rid}]})
     if not doc:
         message.continue_propagation()
 
     try:
         typed = (message.text or "").strip()
-        was = doc["state"]
-        claimed = await _transition(str(doc["_id"]), [was], DONE, {"result": "spelling" if was == WAIT_SP else "custom"})
-        if not claimed or not typed:
+        if not typed:
             return
-        if was == WAIT_SP:
-            sent = await _relay_spelling(bot, claimed, typed)
-            label = f"✏️ Spelling mistake → <code>{html.escape(typed)}</code>"
-        else:
-            sent = await _relay_custom(bot, claimed, typed)
-            label = "💬 Custom message sent"
+        was = doc["state"]
+
+        if was == WAIT_QRY:
+            if not _getfiles_query(typed):
+                await _notice(bot, "⚠️ The search query needs English letters or numbers.")
+                return
+            claimed = await _transition(str(doc["_id"]), [WAIT_QRY], DONE)
+            if not claimed:
+                return
+            await _delete_quietly(bot, message.id)
+            await _finish(bot, claimed, typed)
+            return
+
+        # spelling or custom text: keep it, then ask for the search query
+        field = "spelling" if was == WAIT_SP else "custom"
+        claimed = await _transition(str(doc["_id"]), [was], WAIT_QRY, {field: typed})
+        if not claimed:
+            return
         await _delete_quietly(bot, message.id, claimed.get("prompt_id"))
-        tail = "sent to the support group" if sent else "⚠️ could not post in the support group"
-        await _edit(bot, claimed, f"{_report_text(claimed)}\n\n<b>{label}</b> — {tail}.")
-        if not sent:
-            await _notice(bot, "⚠️ Couldn't post in the support group. Is the bot still an admin there?")
+        await _ask_query(bot, claimed)
     finally:
         message.stop_propagation()   # we own this reply
 
@@ -733,36 +892,48 @@ async def support_message(bot, message):
     _SEEN_TEXT[seen_key] = now
     _prune()
 
+    ai = None
     try:
         ai = await detect_title(text)
-        fallback = ai is None
-        if fallback:
-            # No AI answered. Only a short message that matches a title exactly is trusted;
-            # anything else could be chit-chat, so stay silent rather than bother the admins.
-            if len(text.split()) > 6:
-                return
-            ai = {"is_title": True, "title": text, "year": "", "season": None, "language": "", "confidence": 75}
-        if not ai["is_title"] or not ai["title"]:
+        ai_down = ai is None
+        if ai_down:
+            logger.warning("Support group: no AI answered, using the local word match for %r", text[:60])
+        elif not ai["is_title"] or not ai["title"]:
+            logger.info("Support group: not a title request: %r", text[:60])
+            if SUPPORT_REPORT_ALL:
+                await _create_ask(bot, message, ai, "AI thinks this is not a movie / series request")
             return
 
-        loc = await resolve(ai["title"], ai["year"], ai["season"])
-        sure = ai["confidence"] >= CONF_MIN
+        loc = await resolve_message(ai, text)
+        sure = (not ai_down) and ai["confidence"] >= CONF_MIN
+        if ai_down:   # nothing but the user's own words: trust an exact database match only
+            sure = loc["state"] == "found" and loc.get("via") in ("exact", "phrase", "local")
+        logger.info("Support group: %r -> ai=%s state=%s via=%s sure=%s", text[:60],
+                    (ai or {}).get("title"), loc["state"], loc.get("via"), sure)
 
         if loc["state"] == "found" and sure:
             await _send_card(bot, message.chat.id, message.id, user.id, user.first_name,
-                             loc["results"], ai["title"])
+                             loc["results"], loc.get("title") or (ai or {}).get("title") or text)
             return
-
-        if fallback:
-            return
+        season = (ai or {}).get("season")
         if loc["state"] == "found":
             reason = f"AI is not sure ({ai['confidence']}%), but the database has files for this title"
         elif loc["state"] == "partial":
-            reason = f"Title is in the database but Season {ai['season']} was not found"
+            reason = f"Title is in the database but Season {season} was not found" if season else "Title is in the database but the asked season was not found"
         elif loc["state"] == "ambiguous":
             reason = "Several different titles match this name"
+        elif ai_down:
+            reason = "AI did not answer and the message was not found in the database"
         else:
             reason = "Not found in the database" if sure else f"Not found in the database and AI is not sure ({ai['confidence']}%)"
-        await _create_ask(bot, message, ai, reason)
+        if ai_down and len(text.split()) > 8:
+            return                      # a long message with no AI is almost surely just chat
+        await _create_ask(bot, message, ai or {"title": "", "year": "", "season": None, "confidence": 0}, reason)
     except Exception:
         logger.exception("Support-group message failed: %r", text[:80])
+        # Never stay silent on a failure: let the admins see the message.
+        try:
+            await _create_ask(bot, message, ai or {"title": "", "year": "", "season": None, "confidence": 0},
+                              "The bot hit an error while checking this message")
+        except Exception:
+            logger.exception("Could not even post the report")

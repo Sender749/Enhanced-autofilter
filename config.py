@@ -62,15 +62,10 @@ bin_channel = os.environ.get("BIN_CHANNEL", "-1002262450769") # for stream and d
 BIN_CHANNEL = int(bin_channel) if bin_channel and _id_pattern.match(bin_channel) else None
 
 # ── Support group (AI "already uploaded" helper) ────────────────────────────
-# In these chats the normal autofilter is OFF. Instead the bot reads what people write
-# (any language / any pattern), finds the movie or series name with AI and, if the title
-# is in the database, answers with an "already uploaded" card + Get Files button
-# (plugins/support_group.py). If it is not sure, it asks the admins in the
-# NOT_FOUND_FILE_CHANNEL and stays silent in the group until an admin chooses.
 SUPPORT_GROUP_ENABLED = _bool("SUPPORT_GROUP_ENABLED", True)
-# Chat ids of the support group(s), space separated (e.g. -1001234567890).
+# True = even messages the AI thinks are NOT about a movie/series are sent to the not-found channel.
+SUPPORT_REPORT_ALL = _bool("SUPPORT_REPORT_ALL", False)
 SUPPORT_GROUP_IDS = [i for i in _int_list("SUPPORT_GROUP_IDS", "-1002218070040") if isinstance(i, int)]
-# OR the public usernames of the support group(s), without @ (matched when the group has one).
 SUPPORT_GROUP_USERNAMES = [u.lstrip("@").lower() for u in os.environ.get("SUPPORT_GROUP_USERNAMES", "Navexdisscussion").split() if u.strip()]
 
 
@@ -158,8 +153,8 @@ STREAM_LOCAL_BASELINE_GB = float(os.environ.get("STREAM_LOCAL_BASELINE_GB", "0")
 # Move new links to the next host once a host passes this % of its monthly limit.
 STREAM_SWITCH_PERCENT = int(os.environ.get("STREAM_SWITCH_PERCENT", "85"))
 STREAM_LINK_TTL_HOURS = int(os.environ.get("STREAM_LINK_TTL_HOURS", "6"))
-STREAM_DAILY_LIMIT = int(os.environ.get("STREAM_DAILY_LIMIT", "5"))
-STREAM_PREMIUM_DAILY_LIMIT = int(os.environ.get("STREAM_PREMIUM_DAILY_LIMIT", "20"))
+STREAM_DAILY_LIMIT = int(os.environ.get("STREAM_DAILY_LIMIT", "1"))
+STREAM_PREMIUM_DAILY_LIMIT = int(os.environ.get("STREAM_PREMIUM_DAILY_LIMIT", "5"))
 STREAM_PREFETCH = int(os.environ.get("STREAM_PREFETCH", "4"))            # chunks in flight per download
 STREAM_MAX_CONNECTIONS = int(os.environ.get("STREAM_MAX_CONNECTIONS", "12"))
 STREAM_MAX_PER_LINK = int(os.environ.get("STREAM_MAX_PER_LINK", "8"))    # download managers use several

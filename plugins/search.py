@@ -11,7 +11,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import RPCError
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK
+from config import RESULTS_PER_PAGE, REQUEST_CHANNEL, ADMINS, SUGGESTION_TIMEOUT, NOT_FOUND_FILE_CHANNEL, MOVIE_GROUP_LINK, is_support_chat
 from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
     related_titles, relaxed_search, parse_query,
@@ -418,6 +418,10 @@ def _search_filter(_, __, message):
     # The request / not-found channels are admin work areas. If one of them is a
     # group, an admin's answer typed there ("Hindi Medium") must never start a search.
     if message.chat.id in (REQUEST_CHANNEL, NOT_FOUND_FILE_CHANNEL):
+        return False
+    # The support group has its own AI helper (plugins/support_group.py) — the normal
+    # autofilter results are switched off there.
+    if is_support_chat(message.chat):
         return False
     if message.chat.type == enums.ChatType.PRIVATE:
         # Always let a DM query through to handle_search(): whether PM search is

@@ -50,6 +50,21 @@ def _is_nf_channel(_, __, message) -> bool:
 nf_channel_filter = filters.create(_is_nf_channel)
 
 
+def _is_own_message(message) -> bool:
+    """True for a message the BOT itself posted in the channel.
+
+    The bot's own posts come back to it as updates. The "no files in the database"
+    message (with the Save anyway button) is a text reply under the report, so
+    without this check the reply handler below mistook it for the admin's answer:
+    it searched the bot's own text, deleted the message and posted a new one,
+    which was deleted again, and so on. An admin's reply never carries inline
+    buttons and never comes from the bot, so these checks are safe."""
+    if message.outgoing or message.reply_markup or getattr(message, "via_bot", None):
+        return True
+    user = message.from_user
+    return bool(user and (user.is_self or user.is_bot))
+
+
 def _open_markup(miss_id) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✏️ Fix", callback_data=f"nfa#fix#{miss_id}"),
@@ -189,6 +204,8 @@ async def nf_reply(bot, message):
     # otherwise whichever handler comes first swallows it and the other never runs.
     if (message.text or "").lstrip().startswith("/"):
         message.continue_propagation()
+    if _is_own_message(message):
+        message.continue_propagation()   # the bot's own post (e.g. the Save anyway message) is never an answer
     reply_id = message.reply_to_message_id
     doc = await find_waiting_by_reply(reply_id)
     if not doc:
@@ -216,6 +233,8 @@ async def nf_reply(bot, message):
 async def _process_reply(bot, message, doc: dict):
     typed = (message.text or "").strip()
     if not typed or typed.startswith("/"):
+        return
+    if message.id in (doc.get("followup_msg_id"), doc.get("chat_msg_id")):
         return
 
     chat_id = NOT_FOUND_FILE_CHANNEL

@@ -61,6 +61,29 @@ FETCH_MOVIE_UPDATE = _int_list("FETCH_MOVIE_UPDATE", "-1002028282135")  # List o
 bin_channel = os.environ.get("BIN_CHANNEL", "-1002262450769") # for stream and download link
 BIN_CHANNEL = int(bin_channel) if bin_channel and _id_pattern.match(bin_channel) else None
 
+# ── Support group (AI "already uploaded" helper) ────────────────────────────
+# In these chats the normal autofilter is OFF. Instead the bot reads what people write
+# (any language / any pattern), finds the movie or series name with AI and, if the title
+# is in the database, answers with an "already uploaded" card + Get Files button
+# (plugins/support_group.py). If it is not sure, it asks the admins in the
+# NOT_FOUND_FILE_CHANNEL and stays silent in the group until an admin chooses.
+SUPPORT_GROUP_ENABLED = _bool("SUPPORT_GROUP_ENABLED", True)
+# Chat ids of the support group(s), space separated (e.g. -1001234567890).
+SUPPORT_GROUP_IDS = [i for i in _int_list("SUPPORT_GROUP_IDS", "") if isinstance(i, int)]
+# OR the public usernames of the support group(s), without @ (matched when the group has one).
+SUPPORT_GROUP_USERNAMES = [u.lstrip("@").lower() for u in os.environ.get("SUPPORT_GROUP_USERNAMES", "Navexdisscussion").split() if u.strip()]
+
+
+def is_support_chat(chat) -> bool:
+    """True if `chat` is one of the support groups."""
+    if not SUPPORT_GROUP_ENABLED or chat is None:
+        return False
+    if chat.id in SUPPORT_GROUP_IDS:
+        return True
+    username = (getattr(chat, "username", None) or "").lower()
+    return bool(username) and username in SUPPORT_GROUP_USERNAMES
+
+
 START_BUTTONS = [
     [("⇆ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘs ⇆", "url", "http://t.me/{bot}?startgroup=start")],
     [("• Movie Group", "url", "https://t.me/Navex_Movies"), ("• Pʀᴇᴍɪᴜᴍ", "callback", "premium")],

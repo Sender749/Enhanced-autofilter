@@ -151,6 +151,19 @@ async def start_cmd(bot, message):
         await handle_notcopy(bot, message, payload[len("notcopy_"):])
         return
 
+    if payload.startswith("sgfile-"):
+        # Get Files button from the support group: exactly what typing these words in the
+        # bot DM does (title menu when several titles match, files, relaxed season search...).
+        from plugins.search import handle_search
+
+        search_query = payload[len("sgfile-"):].replace("-", " ").strip()
+        if search_query:
+            message.text = search_query
+            await handle_search(bot, message, from_deep_link=True)
+        else:
+            await send_start(message)
+        return
+
     if payload.startswith("getfile-"):
         # Deep link from a /m movie-update post: run the normal search flow
         # (poster, pagination, season/language/quality filters).

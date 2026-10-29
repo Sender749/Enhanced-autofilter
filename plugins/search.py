@@ -773,7 +773,7 @@ async def season_fallback_clicked(_, query):
 
 
 @Client.on_message(search_filter)
-async def handle_search(bot, message):
+async def handle_search(bot, message, from_deep_link: bool = False):
     logger.info("Search triggered by user %s: %s", message.from_user.id if message.from_user else "unknown", message.text[:50])
     query = message.text.strip()
     if not query:
@@ -782,7 +782,8 @@ async def handle_search(bot, message):
     settings = await get_settings()
 
     # PM Filter switch — only affects the bot's DM. Group search stays always on.
-    if message.chat.type == enums.ChatType.PRIVATE and not settings["pm_filter_enabled"]:
+    # (A support-group Get Files link opens the bot DM on purpose, so it skips this switch.)
+    if message.chat.type == enums.ChatType.PRIVATE and not settings["pm_filter_enabled"] and not from_deep_link:
         mention = message.from_user.mention if message.from_user else "there"
         markup = (
             InlineKeyboardMarkup([[InlineKeyboardButton(PM_SEARCH_OFF_BTN, url=MOVIE_GROUP_LINK)]])

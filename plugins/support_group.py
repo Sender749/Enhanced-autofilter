@@ -369,7 +369,7 @@ def _main_group_markup():
 
 
 def _getfiles_query(title: str) -> str:
-    """Words for the /start getfile-<words> deep link (payload cap is 64 chars)."""
+    """Words for the /start sgfile-<words> deep link (payload cap is 64 chars)."""
     words = re.sub(r"[^A-Za-z0-9_\s]", " ", title).split()
     out = ""
     for w in words:
@@ -451,7 +451,7 @@ async def build_card(results: list, fallback_title: str, header: str, query: str
         text = text[:CAPTION_LIMIT - 1]
 
     query = _getfiles_query(query or title)
-    link = f"https://t.me/{temp.U_NAME}?start=getfile-{query}" if query else f"https://t.me/{temp.U_NAME}"
+    link = f"https://t.me/{temp.U_NAME}?start=sgfile-{query}" if query else f"https://t.me/{temp.U_NAME}"
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 ɢᴇᴛ ꜰɪʟᴇs", url=link)]])
     return text, poster, markup
 
@@ -645,7 +645,7 @@ def _files_markup(query: str, with_group: bool = True):
     rows = []
     q = _getfiles_query(query or "")
     if q:
-        rows.append([InlineKeyboardButton("🔍 ɢᴇᴛ ꜰɪʟᴇs", url=f"https://t.me/{temp.U_NAME}?start=getfile-{q}")])
+        rows.append([InlineKeyboardButton("🔍 ɢᴇᴛ ꜰɪʟᴇs", url=f"https://t.me/{temp.U_NAME}?start=sgfile-{q}")])
     if with_group and MOVIE_GROUP_LINK:
         rows.append([InlineKeyboardButton("🎬 Open Main Group", url=MOVIE_GROUP_LINK)])
     return InlineKeyboardMarkup(rows) if rows else None

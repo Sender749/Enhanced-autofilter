@@ -182,9 +182,20 @@ async def backfill_word_index(batch_size: int = 500) -> int:
 #      instead of being searched as if it were part of the title.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SE_PATTERN = re.compile(r"\bS(\d{1,2})E(\d{1,3})\b", re.IGNORECASE)
-_SEASON_PATTERN = re.compile(r"\bS(\d{1,2})\b|\bSeason\s*(\d{1,2})\b", re.IGNORECASE)
-_EPISODE_PATTERN = re.compile(r"\bE(?:p(?:isode)?)?\s*(\d{1,3})\b", re.IGNORECASE)
+# S01E05, "S02 E04", S01E05T08 (= episodes 5 to 8), and long-running shows (S68E1952).
+_SE_PATTERN = re.compile(r"\bS(\d{1,2})\s?E(\d{1,4})(?:\s?T(\d{1,4}))?\b", re.IGNORECASE)
+# S01, "Season 1", "Season.1", "1st Season".
+_SEASON_PATTERN = re.compile(
+    r"\bS(\d{1,2})\b|\bSeason[\s._-]*(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\s+Season\b", re.IGNORECASE)
+# E05, Ep5, "Ep.05", "Episode 5", "Episode.5".
+_EPISODE_PATTERN = re.compile(r"\bE(?:p(?:isode)?)?\.?\s*(\d{1,4})\b", re.IGNORECASE)
+# Combined episodes: S01E05T08, E01-04, "Ep.01-05", "Episodes 1 to 5".
+_RANGE_PATTERNS = (
+    re.compile(r"\bS\d{1,2}\s?E(\d{1,4})\s?T\s?(\d{1,4})\b", re.IGNORECASE),
+    re.compile(r"\bE(\d{1,4})\s?[-\u2013]\s?E?(\d{1,4})\b", re.IGNORECASE),
+    re.compile(r"\bEp(?:isodes?)?\.?\s*(\d{1,4})\s?(?:[-\u2013]|to)\s?(?:E|Ep\.?)?\s?(\d{1,4})\b", re.IGNORECASE),
+)
+_COMPLETE_PATTERN = re.compile(r"\b(?:complete|comp|full\s+season|all\s+episodes)\b", re.IGNORECASE)
 _YEAR_PATTERN = re.compile(r"\b(19[5-9]\d|20[0-3]\d)\b")
 
 # canonical language -> every spelling/abbreviation seen in real captions
@@ -246,8 +257,19 @@ def _season_of(text: str) -> int:
         return int(m.group(1))
     m = _SEASON_PATTERN.search(text)
     if m:
-        return int(m.group(1) or m.group(2))
+        return int(next(g for g in m.groups() if g))
     return 0
+
+
+def _episode_range_of(text: str):
+    """(first, last) for a combined-episodes file (E01-04, S01E05T08, Ep.01-05), else None."""
+    for pat in _RANGE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if b > a:
+                return a, b
+    return None
 
 
 def _episode_of(text: str) -> int:
@@ -284,6 +306,49 @@ def _quality_of(text: str) -> tuple:
 def _quality_rank(text: str) -> int:
     code, _label = _quality_of(text)
     return _QUALITY_RANK.get(code, 0)
+
+
+_RES_VALUE_RE = re.compile(r"\b(2160|1440|1080|720|576|540|480|360|240)p\b|\b(4k|uhd)\b", re.IGNORECASE)
+
+
+def _resolution_value(text: str) -> int:
+    m = _RES_VALUE_RE.search(text)
+    if not m:
+        return 0
+    return int(m.group(1)) if m.group(1) else 2160
+
+
+def _source_rank(text: str) -> int:
+    """BluRay > WEB-DL > WEBRip > HDRip ... (the source part of _QUALITY_RULES)."""
+    for pat, code, _label in _QUALITY_RULES[5:]:
+        if pat.search(text):
+            return _QUALITY_RANK.get(code, 0)
+    return 0
+
+
+def _order_key(doc: dict) -> tuple:
+    """Series: newest season first; inside a season the single episodes from the last to the
+    first, then the combined-episode files (E01-05, E01-03 ...), then the complete-season
+    files. Every episode keeps its qualities together, best first (1080p, 720p, 480p).
+    Movies: newest year first, qualities together, best first. Movies come before series."""
+    text = _doc_text(doc)
+    season, episode, rng = _season_of(text), _episode_of(text), _episode_range_of(text)
+    res, src = _resolution_value(text), _source_rank(text)
+    if season or episode or rng:
+        if rng:
+            kind, a, b = 1, -rng[1], -rng[0]
+        elif episode:
+            kind, a, b = 0, -episode, 0
+        else:
+            kind, a, b = 2, 0, 0
+        return (1, -season, kind, a, b, -res, -src)
+    year = _year_of(text)
+    return (0, -(int(year) if year else 0), 0, 0, 0, -res, -src)
+
+
+def order_results(results: list) -> list:
+    """The display order of a result list (see _order_key). Stable for equal keys."""
+    return sorted(results, key=_order_key)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -455,7 +520,7 @@ def clean_display_text(text: str) -> str:
 _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?>")
 _LANG_ALTS = "|".join(re.escape(a) for aliases in _LANGUAGE_ALIASES.values() for a in aliases)
 _JUNK_ALTS = (
-    r"s\d{1,2}e?\d{0,3}|season\s*\d+|ep(?:isode)?\.?\s*\d+|\d{3,4}p|4k|uhd|hdr\d*|"
+    r"s\d{1,2}e?\d{0,4}|e\d{2,4}|season[\s._-]*\d+|\d{1,2}(?:st|nd|rd|th)[\s._-]*season|combined\s+episodes?|complete\s+season|ep(?:isode)?[\s._-]*\d+|\d{3,4}p|4k|uhd|hdr\d*|"
     r"bluray|bdrip|remux|web-?dl|webrip|hdrip|dvdrip|hdtv|cam|hdts|ts|"
     r"hevc|x264|x265|avc|av1|aac|ddp\d?\.?\d?|dts|flac|mp3|ac3|mp4|mkv|avi|mov|webm|m4v|m2ts|"
     r"esubs?|subs?|subbed|dubbed|dual\s*audio|multi\s*audio|dual|multi|"
@@ -565,6 +630,45 @@ def get_noise_words() -> frozenset:
 # "Action Movie  Rifle Ganj | Om Puri, ..." — a genre/language label plus the
 # word Movie/Film in front of the title. Only the label+Movie pair is removed,
 # never a bare "Crime" or "Family" (Crime Patrol, Family Guy are real titles).
+# "S01 E08 Mastram", "S01 • E11 • Medusa", "E01-04 S01 • Farzi 2023", "S1 EP23 Fireworks of My
+# Heart", "Episode 08 The Enormous Black Hole", "S03 Complete • Kota Factory": season / episode
+# markers IN FRONT of the title. Without this the "title" of these files was the marker itself
+# (S1, E01 04, S01 E08 Mastram) and no search for the real title could find them.
+_LEADING_SE_RE = re.compile(
+    r"^[\W_]*(?:"
+    r"S\d{1,2}\s?E\d{1,4}(?:\s?[-T]\s?E?\d{1,4})?"
+    r"|S\d{1,2}\s?[-\u2013\u2022]\s?\d{1,4}"
+    r"|S\d{1,2}(?=[\s\W_])|Season[\s._-]*\d{1,2}"
+    r"|E\d{1,4}(?:\s?[-\u2013]?\s?E?\d{1,4})?"
+    r"|Ep(?:isodes?)?[\s._-]*\d{1,4}(?:\s?[-\u2013]\s?\d{1,4})?"
+    r")(?![^\W_])[\W_]*",
+    re.IGNORECASE,
+)
+# "Complete" / "Combined" are only markers right AFTER an S/E marker ("S03 Complete • Kota
+# Factory"); at the very start they can be a real title word ("Complete Unknown").
+_LEADING_SE_WORD_RE = re.compile(r"^[\W_]*(?:Complete|Comp|Combined)(?![^\W_])[\W_]*", re.IGNORECASE)
+
+
+def _strip_leading_se(t: str) -> str:
+    """Remove leading season/episode markers — but only when a real title follows them."""
+    cur, stripped_any = t, False
+    for _ in range(5):
+        m = _LEADING_SE_RE.match(cur) or (stripped_any and _LEADING_SE_WORD_RE.match(cur))
+        if not m:
+            break
+        rest = cur[m.end():]
+        if not rest or not re.match(r"[^\W\d_]", rest):   # a title starts with a letter
+            break
+        cur, stripped_any = rest, True
+    if cur is not t and _HAS_LETTER_RE.search(cur):
+        first = re.match(r"[\W_]*([^\W_]+)", cur)
+        cut = _tag_cut_position(cur, 0)
+        # the first word must not itself be a tag ("S02 E04 Web Series 720p" has no title)
+        if cut >= 2 and first and first.group(1).lower() not in _TAG_FILLER:
+            return cur
+    return t
+
+
 _LEADING_LABEL_RE = re.compile(
     r"^\s*(?:action|drama|comedy|romantic|romance|thriller|horror|crime|family|adventure|"
     r"animation|animated|sci[\s-]?fi|south|bollywood|hollywood|punjabi|hindi|tamil|telugu|"
@@ -602,6 +706,7 @@ def clean_title(text: str) -> str:
     stripped = _LEADING_LABEL_RE.sub("", t, count=1)
     if _HAS_LETTER_RE.search(stripped):
         t = stripped
+    t = _strip_leading_se(t)
     if _NOISE_WORDS:
         for _ in range(4):
             m = _LEADING_WORD_RE.match(t)
@@ -658,7 +763,7 @@ def clean_title(text: str) -> str:
 # Bump this whenever the rules that build a title key change (clean_title /
 # title_key). Files stored with an older number are re-keyed automatically by
 # the startup backfill, so a rule change never leaves old files behind.
-KEY_VERSION = 4
+KEY_VERSION = 5   # 5: season/episode markers in front of / after a title are cut (clean_title)
 _KEY_STOPWORDS = frozenset()  # articles (the/a/an) are NOT dropped: "The Flash" and "Flash" are different titles
 _KEY_WORD_RE = re.compile(r"[^\W_]+")
 _KEY_APOSTROPHE_RE = re.compile(r"['\u2019\u2018`\u00b4]")
@@ -788,7 +893,22 @@ _TRAILING_SE_RE = re.compile(
     r"^(?P<title>.*\S)\s+S(?P<season>\d{1,2})E(?P<episode>\d{1,3})\s*$", re.IGNORECASE,
 )
 _TRAILING_SEASON_RE = re.compile(
-    r"^(?P<title>.*\S)\s+(?:S(?P<season1>\d{1,2})|Season\s*(?P<season2>\d{1,2}))\s*$", re.IGNORECASE,
+    r"^(?P<title>.*\S)\s+(?:S(?P<season1>\d{1,2})|Season[\s._-]*(?P<season2>\d{1,2}))\s*$", re.IGNORECASE,
+)
+# "1st season", "2nd season", "first season", "season one" — how people really write it.
+_ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+                  "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10}
+_NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                 "eight": 8, "nine": 9, "ten": 10}
+_TRAILING_SEASON_WORD_RE = re.compile(
+    r"^(?P<title>.*\S)\s+(?:"
+    r"(?:(?P<ord_n>\d{1,2})(?:st|nd|rd|th)|(?P<ord_w>" + "|".join(_ORDINAL_WORDS) + r"))[\s._-]*Season"
+    r"|Season[\s._-]*(?P<num_w>" + "|".join(_NUMBER_WORDS) + r")"
+    r")\s*$", re.IGNORECASE,
+)
+# Words people add after the title that are not part of it ("... season 2 full episodes").
+_TRAILING_FILLER_RE = re.compile(
+    r"^(?P<title>.*?\S)\s+(?:(?:full|complete|all)\s+(?:episodes?|seasons?|series)|episodes)\s*$", re.IGNORECASE,
 )
 _TRAILING_EPISODE_RE = re.compile(
     r"^(?P<title>.*\S)\s+(?:Episode|Ep)\.?\s*(?P<episode>\d{1,3})\s*$", re.IGNORECASE,
@@ -814,8 +934,10 @@ _TRAILING_LANG_RE = re.compile(
 )
 
 _TRAILING_PATTERNS = [
+    ("filler", _TRAILING_FILLER_RE),
     ("se", _TRAILING_SE_RE),
     ("season", _TRAILING_SEASON_RE),
+    ("season_word", _TRAILING_SEASON_WORD_RE),
     ("episode", _TRAILING_EPISODE_RE),
     ("year", _TRAILING_YEAR_RE),
     ("resolution", _TRAILING_RESOLUTION_RE),
@@ -852,7 +974,14 @@ def parse_query(query: str) -> tuple:
             if not candidate:
                 continue  # would empty the title out — refuse and try nothing else this round
 
-            if kind == "se":
+            if kind == "filler":
+                pass
+            elif kind == "season_word":
+                num = (int(m.group("ord_n")) if m.group("ord_n")
+                       else _ORDINAL_WORDS.get((m.group("ord_w") or "").lower())
+                       or _NUMBER_WORDS.get((m.group("num_w") or "").lower()))
+                tags["season"] = tags["season"] if tags["season"] is not None else num
+            elif kind == "se":
                 tags["season"] = tags["season"] if tags["season"] is not None else int(m.group("season"))
                 tags["episode"] = tags["episode"] if tags["episode"] is not None else int(m.group("episode"))
             elif kind == "season":
@@ -1114,7 +1243,13 @@ async def search_files(query: str, use_alias: bool = True) -> list:
         from database.alias_db import get_alias
         aliased = await get_alias(query_key)
         if aliased:
-            query_key = key_source = aliased
+            # The alias may itself carry a tag ("last kingdom s01"): split it like a typed
+            # query. Tags the user typed win; the alias only fills in the missing ones.
+            alias_title, alias_tags = parse_query(aliased)
+            query_key = key_source = alias_title
+            for name, value in alias_tags.items():
+                if tags.get(name) is None:
+                    tags[name] = value
 
     # Primary path: one indexed lookup on the spacing/symbol-proof title key
     # ("spiderman" = "spider man" = "Spider-Man", "force of the forrest" =
@@ -1138,8 +1273,7 @@ async def search_files(query: str, use_alias: bool = True) -> list:
     if active_tags:
         results = apply_filters(results, active_tags)
 
-    results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
-    return results[:_MAX_FETCH]
+    return order_results(results)[:_MAX_FETCH]
 
 
 async def search_by_title_keys(keys: list) -> list:
@@ -1149,8 +1283,7 @@ async def search_by_title_keys(keys: list) -> list:
         return []
     cursor = files.find({"tkeys": {"$in": list(keys)}}, _RESULT_FIELDS).limit(_CANDIDATE_FETCH)
     results = await cursor.to_list(length=_CANDIDATE_FETCH)
-    results.sort(key=lambda d: -_quality_rank(_doc_text(d)))
-    return results[:_MAX_FETCH]
+    return order_results(results)[:_MAX_FETCH]
 
 
 async def relaxed_search(query: str) -> dict | None:

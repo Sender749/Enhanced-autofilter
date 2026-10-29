@@ -524,6 +524,16 @@ def _has_tags(query: str) -> bool:
     return any(v is not None for v in parse_query(query)[1].values())
 
 
+def _narrow_by_query_tags(results: list, query: str) -> list:
+    """The words typed after the title ("last kingdom season 3", "loki s02e04 1080p") still count
+    when the title was found through the title menu / phrase search: keep only the files that
+    fit them. If nothing fits, keep everything — the user then sees what does exist."""
+    tags = {k: v for k, v in parse_query(query)[1].items() if v is not None}
+    if not tags:
+        return results
+    return apply_filters(results, tags) or results
+
+
 def _title_cache_put(key: str, buttons: list, query: str):
     if len(_TITLE_CACHE) >= _CACHE_MAX_ENTRIES:
         oldest = min(_TITLE_CACHE, key=lambda k: _TITLE_CACHE[k]["time"])
@@ -599,7 +609,7 @@ async def title_clicked(_, query):
         return
     btn = entry["buttons"][int(idx)]
     _SUGGESTION_TRACKER.pop(query.message.id, None)
-    results = await files_for_button(btn)
+    results = _narrow_by_query_tags(await files_for_button(btn), entry["query"])
     if not results:
         await query.message.edit_text(
             SUGGESTION_NOT_FOUND_TXT.format(title=html.escape(btn["title"])) + _remaining_note(query.message),
@@ -896,7 +906,7 @@ async def handle_search(bot, message, from_deep_link: bool = False):
                 break
         if buttons:
             if len(buttons) == 1:
-                found = await files_for_button(buttons[0])
+                found = _narrow_by_query_tags(await files_for_button(buttons[0]), used)
                 if found:
                     label = buttons[0]["title"] + (f" ({buttons[0]['year_label']})" if buttons[0]["years"] is not None else "")
                     await _deliver_results(message, label, found)

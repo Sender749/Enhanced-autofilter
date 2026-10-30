@@ -37,7 +37,7 @@ styled_buttons.install(BOT_TOKEN)  # blue/green/red button colours (no-op if BUT
 
 USER_COMMANDS = [
     BotCommand("start", "Start the bot"),
-    BotCommand("trending", "Most searched titles"),
+    BotCommand("trend", "Most searched titles"),
     BotCommand("myplan", "Check your premium status"),
     BotCommand("req", "Request a file"),
 ]

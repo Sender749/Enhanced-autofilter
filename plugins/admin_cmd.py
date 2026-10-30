@@ -97,8 +97,10 @@ async def admin_callbacks(bot, query):
         return
 
     if action == "stats":
-        count = await total_files()
-        await query.answer(f"Indexed files: {count}", show_alert=True)
+        from plugins.stats_panel import page_home      # lazy: sibling plugin
+        await query.answer()
+        text, markup = await page_home(bot)
+        await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         return
 
     await query.answer()

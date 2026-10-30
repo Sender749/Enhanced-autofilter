@@ -28,6 +28,7 @@ from database.premium_db import has_premium_access
 from database.settings_db import get_settings
 from database.verify_db import required_tier, create_token
 from database.limit_db import get_today_count, increment_today
+from database.stats_db import record_file, record_verify_prompt
 from plugins.force_sub import missing_channels
 from fastdl.links import start_button_markup
 from shortlink import make_short_link
@@ -108,6 +109,8 @@ async def _send_file(bot, user_id: int, doc: dict, remaining: tuple | None = Non
         await bot.send_message(user_id, FILE_NOT_FOUND_TXT)
         return
 
+    record_file(user_id, name)          # daily stats (/stats panel)
+
     settings = await get_settings()
     if settings["file_autodelete_enabled"]:
         asyncio.create_task(_schedule_file_delete(bot, sent, settings["file_autodelete_seconds"]))
@@ -140,6 +143,7 @@ async def _schedule_file_delete(bot, sent_message, seconds: int):
 
 async def _send_verify_prompt(bot, user_id: int, tier: int, file_id: str, settings: dict):
     token = await create_token(user_id, tier, file_id)
+    record_verify_prompt(tier)          # daily stats (/stats panel)
     shortener = settings["shorteners"].get(str(tier), {})
     long_url = f"https://t.me/{temp.U_NAME}?start=notcopy_{token}"
     short_url = await make_short_link(long_url, shortener.get("domain", ""), shortener.get("api", ""))

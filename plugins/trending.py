@@ -52,7 +52,7 @@ async def _build(page: int):
     return TRENDING_HEADER_TXT, InlineKeyboardMarkup(rows)
 
 
-@Client.on_message(filters.command("trending"))
+@Client.on_message(filters.command("trend"))
 async def trending_cmd(_, message):
     settings = await get_settings()
     if not settings["autofilter_enabled"]:

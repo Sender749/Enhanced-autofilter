@@ -19,6 +19,7 @@ import string
 from datetime import datetime, timedelta, timezone
 
 from database.client import db
+from database.stats_db import record_verify_done
 from utils import IST, ensure_utc
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ async def mark_verified(user_id: int, tier: int):
         {"$set": {field: _now()}},
         upsert=True,
     )
+    await record_verify_done(user_id, tier)     # daily stats (/stats panel); never raises
 
 
 # ── short-lived tokens used in the notcopy_<token> deep link ────────────────

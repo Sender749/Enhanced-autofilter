@@ -19,6 +19,7 @@ Aliases are cached in memory (loaded once, updated on every change), so the
 lookup done at the start of every search costs a dict lookup, not a DB trip.
 """
 import logging
+import re
 from datetime import datetime, timezone
 
 from bson import ObjectId
@@ -80,6 +81,20 @@ async def get_alias(key: str) -> str | None:
         return None
     target = cache.get(key)
     return target if target and target != key else None
+
+
+async def alias_query(query: str) -> str | None:
+    """The query with its TITLE replaced by the admin-approved alias target ("50 shades hindi" ->
+    "fifty shades hindi"), tags as typed. None when the title has no alias. Lets the phrase search,
+    typo fixer and title suggestions use an alias too — not only the exact-title lookup."""
+    q = re.sub(r"\s+", " ", (query or "").strip())
+    if not q:
+        return None
+    title = parse_query(q)[0]
+    target = await get_alias(clean_title(title).lower())
+    if not target:
+        return None
+    return f"{target}{q[len(title):]}".strip()
 
 
 async def save_alias(key: str, target_key: str, target_title: str, by: str = "admin") -> None:

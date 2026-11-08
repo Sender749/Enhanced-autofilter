@@ -1,328 +1,199 @@
-import asyncio
-import html
-import logging
+import os
+import re
 
-from pyrogram import Client, filters, enums
-from pyrogram.errors import MessageNotModified
-from pyrogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo,
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+_id_pattern = re.compile(r'^-?\d+$')
+
+
+def _bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on", "enable", "y")
+
+
+def _int_list(name: str, default: str = "") -> list:
+    raw = os.environ.get(name, default)
+    out = []
+    for item in raw.split():
+        item = item.strip()
+        if not item:
+            continue
+        out.append(int(item) if _id_pattern.match(item) else item)
+    return out
+
+
+# ── Telegram credentials ─────────────────────────────────────────────────────
+API_ID = int(os.environ.get("API_ID", "29453152"))
+API_HASH = os.environ.get("API_HASH", "2302adc174dbc954ae5081eda5131166")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMINS = _int_list("ADMINS", "6541030917 1052054451")
+DATABASE_URI = os.environ.get("DATABASE_URI", "mongodb+srv://autofilter:filter@cluster0.iitbepl.mongodb.net/?appName=Cluster0")
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "Cluster0")
+COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "navex")
+ENABLE_PM_SEARCH = _bool("ENABLE_PM_SEARCH", True)
+RESULTS_PER_PAGE = int(os.environ.get("RESULTS_PER_PAGE", "8"))
+MOVIE_GROUP_LINK = os.environ.get("MOVIE_GROUP_LINK", "https://t.me/Navex_Movies")
+WELCOME_VIDEO = os.environ.get("WELCOME_VIDEO", "BAACAgUAAxkBAALem2rErmTjC-uPtJfuD-7q6np6lBWIAAJ1FQACyBhRVjH6nRmO9C86HgQ").strip()
+RESTART_NOTIFY = _bool("RESTART_NOTIFY", True)
+SUGGESTION_TIMEOUT = int(os.environ.get("SUGGESTION_TIMEOUT", "120"))  # seconds
+MOVIE_UPDATE_NOTIFICATION = _bool("MOVIE_UPDATE_NOTIFICATION", True)  # Notification On/Off
+OWNER_LINK = os.environ.get("OWNER_LINK", "https://t.me/Navex_69")
+
+# ── Channels ─────────────────────────────────────────────────────
+# database channel list (use space to seprate)
+CHANNELS = _int_list("CHANNELS", "-1002066489726 -1002445793312 -1002407564854 -1002467109334 -1003941255241")
+log_channel = os.environ.get("LOG_CHANNEL", "-1002262450769")
+LOG_CHANNEL = int(log_channel) if log_channel and _id_pattern.match(log_channel) else None
+request_channel = os.environ.get("REQUEST_CHANNEL", "-1002380553501")
+REQUEST_CHANNEL = int(request_channel) if request_channel and _id_pattern.match(request_channel) else None
+not_found_channel = os.environ.get("NOT_FOUND_FILE_CHANNEL", "-1002279624678")
+NOT_FOUND_FILE_CHANNEL = int(not_found_channel) if not_found_channel and _id_pattern.match(not_found_channel) else None
+movie_update_channel = os.environ.get("MOVIE_UPDATE_CHANNEL", "-1002333962739")
+MOVIE_UPDATE_CHANNEL = int(movie_update_channel) if movie_update_channel and _id_pattern.match(movie_update_channel) else None
+fetch_update_channels = os.environ.get("FETCH_MOVIE_UPDATE", "-1002028282135")  # Movie Update Fetch Channels (space-separated)
+FETCH_MOVIE_UPDATE = _int_list("FETCH_MOVIE_UPDATE", "-1002028282135")  # List of channel IDs for auto-fetch
+bin_channel = os.environ.get("BIN_CHANNEL", "-1002262450769") # for stream and download link
+BIN_CHANNEL = int(bin_channel) if bin_channel and _id_pattern.match(bin_channel) else None
+
+# ── Support group (AI "already uploaded" helper) ────────────────────────────
+SUPPORT_GROUP_ENABLED = _bool("SUPPORT_GROUP_ENABLED", True)
+# True = even messages the AI thinks are NOT about a movie/series are sent to the not-found channel.
+SUPPORT_REPORT_ALL = _bool("SUPPORT_REPORT_ALL", False)
+SUPPORT_GROUP_IDS = [i for i in _int_list("SUPPORT_GROUP_IDS", "-1002218070040") if isinstance(i, int)]
+SUPPORT_GROUP_USERNAMES = [u.lstrip("@").lower() for u in os.environ.get("SUPPORT_GROUP_USERNAMES", "Navexdisscussion").split() if u.strip()]
+
+
+def is_support_chat(chat) -> bool:
+    """True if `chat` is one of the support groups."""
+    if not SUPPORT_GROUP_ENABLED or chat is None:
+        return False
+    if chat.id in SUPPORT_GROUP_IDS:
+        return True
+    username = (getattr(chat, "username", None) or "").lower()
+    return bool(username) and username in SUPPORT_GROUP_USERNAMES
+
+
+START_BUTTONS = [
+    [("⇆ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘs ⇆", "url", "http://t.me/{bot}?startgroup=start")],
+    [("• Movie Group", "url", "https://t.me/Navex_Movies"), ("• Pʀᴇᴍɪᴜᴍ", "callback", "premium")],
+    [("• Support Group", "url", "https://t.me/Navexdisscussion")],
+]
+
+WELCOME_BUTTONS = [
+    [("⇆ Support Group ⇆", "url", "https://t.me/Navexdisscussion")],
+ #   [
+ #       ("• Support Group", "url", "https://t.me/Navexdisscussion"),
+ #       ("• Bot PM", "url", "http://t.me/{bot}?start=start"),
+ #   ],
+]
+
+GROUP_WELCOME_TXT = (
+    "<b>👋 ᴡᴇʟᴄᴏᴍᴇ {mention} ᴛᴏ {chat}!\n\n"
+    "🎬 ᴊᴜsᴛ ᴛʏᴘᴇ ᴀ ᴍᴏᴠɪᴇ / sᴇʀɪᴇs ɴᴀᴍᴇ ʜᴇʀᴇ ᴀɴᴅ ɪ'ʟʟ ꜰɪɴᴅ ɪᴛ ꜰᴏʀ ʏᴏᴜ.\n"
+    "📹 ᴡᴀᴛᴄʜ ᴛʜᴇ ᴠɪᴅᴇᴏ ᴀʙᴏᴠᴇ ᴛᴏ sᴇᴇ ʜᴏᴡ ɪ ᴡᴏʀᴋ.</b>"
 )
+WELCOME_DELETE_AFTER = int(os.environ.get("WELCOME_DELETE_AFTER", "120"))
 
-from config import (
-    WELCOME_VIDEO, START_BUTTONS, WELCOME_BUTTONS, GROUP_WELCOME_TXT,
-    WELCOME_DELETE_AFTER, PREMIUM_PHOTO, OWNER_LINK, ADMINS,
-    SUPPORT_WELCOME_TXT, SUPPORT_WELCOME_PHOTO, SUPPORT_WELCOME_BUTTONS, is_support_chat,
+# ── Support group welcome (used instead of the main-group welcome above) ─────
+# Photo: set it from the bot with /setsupportphoto (reply to a photo) and remove it with
+# /delsupportphoto. SUPPORT_WELCOME_PHOTO (a URL or file_id) is only the fallback when no photo
+# was set that way. No photo at all -> the welcome is sent as text only.
+SUPPORT_WELCOME_PHOTO = os.environ.get("SUPPORT_WELCOME_PHOTO", "").strip()
+SUPPORT_WELCOME_TXT = (
+    "<b>👋 ᴡᴇʟᴄᴏᴍᴇ {mention} ᴛᴏ {chat}!\n\n"
+    "🛟 ᴄᴀɴ'ᴛ ꜰɪɴᴅ ᴀ ᴍᴏᴠɪᴇ / sᴇʀɪᴇs ᴏʀ ɴᴇᴇᴅ ʜᴇʟᴘ?\n"
+    "✍️ ᴊᴜsᴛ ᴛʏᴘᴇ ɪᴛs ɴᴀᴍᴇ ʜᴇʀᴇ. ɪꜰ ɪᴛ's ᴀʟʀᴇᴀᴅʏ ᴜᴘʟᴏᴀᴅᴇᴅ ɪ'ʟʟ sʜᴏᴡ ɪᴛ ᴡɪᴛʜ ᴀ ɢᴇᴛ ꜰɪʟᴇs ʙᴜᴛᴛᴏɴ, "
+    "ᴏᴛʜᴇʀᴡɪsᴇ ᴏᴜʀ ᴛᴇᴀᴍ ᴡɪʟʟ ʜᴇʟᴘ ʏᴏᴜ.\n\n"
+    "🎬 ᴛᴏ sᴇᴀʀᴄʜ ʏᴏᴜʀsᴇʟꜰ, ᴜsᴇ ᴛʜᴇ ᴍᴀɪɴ ɢʀᴏᴜᴘ ʙᴇʟᴏᴡ.</b>"
 )
-from database.premium_db import get_premium
-from database.settings_db import get_settings, update_settings
-from log_utils import register_user
-from plugins.deliver import deliver_file
-from plugins.verify import handle_notcopy
-from utils import IST, temp
-from strings import (
-    START_TXT, PREMIUM_TEXT, HELP_TXT,
-    MYPLAN_ACTIVE_TXT, MYPLAN_NONE_TXT,
-    PREMIUM_OWNER_BTN, PREMIUM_MYPLAN_BTN, PREMIUM_BACK_BTN,
-    MYPLAN_ALERT_ACTIVE, MYPLAN_ALERT_NONE,
-)
+SUPPORT_WELCOME_BUTTONS = [
+    [("🎬 Main Group", "url", MOVIE_GROUP_LINK), ("👤 Owner", "url", OWNER_LINK)],
+]
 
-logger = logging.getLogger(__name__)
-HTML = enums.ParseMode.HTML
+# ── Premium page ─────────────────────────────────────────────────────────────
+PREMIUM_PHOTO = os.environ.get("PREMIUM_PHOTO", "").strip()
+TELEGRAPH_PROVIDER = os.environ.get("TELEGRAPH_PROVIDER", "auto").strip().lower()
 
-_GROUP_TYPES = (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP)
+# ── Automatic poster fetch (TMDB primary, OMDb fallback) ───────────────────
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "e166a67b9b21ee3bd84bc189d567057b")
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "436aac9c")
+POSTER_FETCH_TIMEOUT = int(os.environ.get("POSTER_FETCH_TIMEOUT", "6"))
 
+# ── Typo-correction fallback (only runs when exact search finds nothing) ───
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IkIRyZr_PlKTFG8KLhxpArWz3yOFlJpCNqpc3fwlpuNg")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+AI_FETCH_TIMEOUT = int(os.environ.get("AI_FETCH_TIMEOUT", "6"))
+FUZZY_MATCH_THRESHOLD = int(os.environ.get("FUZZY_MATCH_THRESHOLD", "82"))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers — button layouts from config.py and "send a playable video" fallbacks
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Movie Update Display Settings ─────────────────────────────────────────
+LINK_PREVIEW = _bool("LINK_PREVIEW", False)  # Shows link preview instead of image
+ABOVE_PREVIEW = _bool("ABOVE_PREVIEW", True)  # Shows link preview above text if True
+TMDB_POSTER = _bool("TMDB_POSTER", True)  # Shows TMDB poster in notification
+LANDSCAPE_POSTER = _bool("LANDSCAPE_POSTER", True)  # Shows landscape poster
 
-def build_markup(layout):
-    """config tuples -> InlineKeyboardMarkup.
-    Each button: (text, "url" | "callback", value). Bad / empty entries are
-    skipped (and logged) so one typo in config.py can never break /start."""
-    rows = []
-    for row in layout or []:
-        buttons = []
-        for item in row:
-            try:
-                text, kind, value = item
-                value = str(value).replace("{bot}", temp.U_NAME or "")
-                if not value:
-                    continue
-                if str(kind).lower() == "url":
-                    buttons.append(InlineKeyboardButton(text, url=value))
-                elif str(kind).lower() in ("callback", "cb", "callback_data"):
-                    buttons.append(InlineKeyboardButton(text, callback_data=value))
-                else:
-                    logger.warning("Unknown button type %r in config.py: %r", kind, item)
-            except Exception:
-                logger.warning("Bad button entry in config.py: %r", item, exc_info=True)
-        if buttons:
-            rows.append(buttons)
-    return InlineKeyboardMarkup(rows) if rows else None
+# ── Web server (Koyeb requires the app to bind $PORT) ────────────────────────
+PORT = int(os.environ.get("PORT", "8080"))
 
+# ── Fast Download (optional — fully disabled until configured) ───────────────
+STREAM_ONLY = _bool("STREAM_ONLY", False)  # True on the Oracle server (no bot, just streaming)
+STREAM_SECRET = os.environ.get("STREAM_SECRET", "BQHBa2AAB2Gkf7fVzKe7laAj3-sVJdoVgs7kdqElm_ivE4bUGIML4SNioZOtM_oBIk-Gal_oszjfAT7QIumIVsCMXVuyD0Gh29p1204DwCQ03-H28cieNGmi7-q75p0LETReT3xm54yhXKu1lfcpwu5eNMs9YeI9uPD2yeplb1ma3HyEFnTgJLSGXSR6Ww2EcNvVvum25FElPQlQ___oEdfTMygfTOmILhxkk3ehTTg1a0TrbfdGooam7-1eggRmFHw4kOQbjWRIvvVegOwlt-PZEfHYBviqr0KQftEAjSJ2pS6kvVM5qioOyGbSK8iIKraNBRp6SWv9JZpkDxyRagtMhQbtaAAAAAHGKGRSAA").strip()   # must be identical on every host
+HELPER_BOT_TOKENS = os.environ.get("HELPER_BOT_TOKENS", "").split()  # extra bots = more speed
 
-async def _reply_media(message, text, markup, *, photo=None, video=None, quote=False):
-    """Reply with a real photo / playable video + caption. Falls back to plain
-    text if the media can't be sent (wrong file_id, bad URL, ...)."""
-    kw = dict(caption=text, reply_markup=markup, parse_mode=HTML, quote=quote)
-    if photo:
-        try:
-            return await message.reply_photo(photo, **kw)
-        except Exception:
-            logger.warning("Couldn't send photo %r — falling back", photo, exc_info=True)
-    if video:
-        try:
-            if str(video).startswith("http"):
-                return await message.reply_video(video, supports_streaming=True, **kw)
-            return await message.reply_cached_media(video, **kw)
-        except Exception:
-            logger.warning("Couldn't send welcome video %r — falling back to text", video, exc_info=True)
-    return await message.reply_text(
-        text, reply_markup=markup, quote=quote, parse_mode=HTML, disable_web_page_preview=True,
+# Public URL of THIS deployment (Koyeb/Render), e.g. https://my-bot.koyeb.app https://internal-raychel-filetokensender-50bf89aa.koyeb.app/
+STREAM_BASE_URL = os.environ.get("STREAM_BASE_URL", "https://internal-raychel-filetokensender-50bf89aa.koyeb.app/").strip().rstrip("/")
+STREAM_BANDWIDTH_LIMIT_GB = float(os.environ.get("STREAM_BANDWIDTH_LIMIT_GB", "100"))
+
+# Oracle Always-Free stream server — leave ORACLE_STREAM_URL empty to keep it disabled.
+ORACLE_STREAM_URL = os.environ.get("ORACLE_STREAM_URL", "").strip().rstrip("/")
+ORACLE_BANDWIDTH_LIMIT_GB = float(os.environ.get("ORACLE_BANDWIDTH_LIMIT_GB", "10000"))
+
+# Failover tuning — every one of these is optional.
+STREAM_HEALTH_TIMEOUT = float(os.environ.get("STREAM_HEALTH_TIMEOUT", "2.5"))   # seconds for the Oracle /health probe
+# Set on the ORACLE server only: when its own stream clients are down it 302-redirects /dl, /stream
+# and /watch (same token) to this URL, e.g. your Koyeb app. Empty = redirect OFF.
+STREAM_FALLBACK_URL = os.environ.get("STREAM_FALLBACK_URL", "").strip().rstrip("/")
+# Oracle server only: where it saves its real monthly byte counter (it has no database).
+STREAM_USAGE_FILE = os.environ.get("STREAM_USAGE_FILE", "stream_usage.json").strip()
+# Bot/Koyeb only: GB already used this month before real counting began. Optional, set it once
+# (e.g. from Koyeb's usage CSV) and remove it next month. 0 = off.
+STREAM_LOCAL_BASELINE_GB = float(os.environ.get("STREAM_LOCAL_BASELINE_GB", "0") or 0)
+
+# Move new links to the next host once a host passes this % of its monthly limit.
+STREAM_SWITCH_PERCENT = int(os.environ.get("STREAM_SWITCH_PERCENT", "85"))
+STREAM_LINK_TTL_HOURS = int(os.environ.get("STREAM_LINK_TTL_HOURS", "6"))
+STREAM_DAILY_LIMIT = int(os.environ.get("STREAM_DAILY_LIMIT", "5"))
+STREAM_PREMIUM_DAILY_LIMIT = int(os.environ.get("STREAM_PREMIUM_DAILY_LIMIT", "5"))
+STREAM_PREFETCH = int(os.environ.get("STREAM_PREFETCH", "4"))            # chunks in flight per download
+STREAM_MAX_CONNECTIONS = int(os.environ.get("STREAM_MAX_CONNECTIONS", "12"))
+STREAM_MAX_PER_LINK = int(os.environ.get("STREAM_MAX_PER_LINK", "8"))    # download managers use several
+FASTDL_ENABLED = bool(BIN_CHANNEL and STREAM_SECRET and (STREAM_BASE_URL or ORACLE_STREAM_URL))
+FASTDL_SERVER_ENABLED = bool(BIN_CHANNEL and STREAM_SECRET)
+
+# ── Web app (Telegram Mini App) ─────────────────────────────────────────────
+WEBAPP_ENABLED = _bool("WEBAPP_ENABLED", True)
+# Public https URL where /app is served. Defaults to the stream base URL (same Koyeb service).
+WEBAPP_URL = (os.environ.get("WEBAPP_URL", "https://internal-raychel-filetokensender-50bf89aa.koyeb.app/").strip() or STREAM_BASE_URL).rstrip("/")
+WEBAPP_SYNC_SECONDS = int(os.environ.get("WEBAPP_SYNC_SECONDS", "600"))  # how often new files are added to the catalog
+
+# ── Fail fast on missing essentials instead of crashing deep in pyrogram ────
+_REQUIRED = {
+    "API_ID": API_ID,
+    "API_HASH": API_HASH,
+    "DATABASE_URI": DATABASE_URI,
+}
+if not STREAM_ONLY:  # the Oracle stream server runs without the main bot token
+    _REQUIRED["BOT_TOKEN"] = BOT_TOKEN
+_missing = [k for k, v in _REQUIRED.items() if not v]
+if _missing:
+    raise SystemExit(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        f"Set them in your environment (see .env.sample)."
     )
-
-
-async def _swap_message(bot, query, text, markup, *, photo=None, video=None):
-    """Turn the message a button was pressed on into another page (video <-> photo
-    <-> text). Telegram can't turn text into media (or media into text) in place,
-    so in that case the old message is deleted and a fresh one is sent."""
-    msg = query.message
-    media = None
-    if photo:
-        media = InputMediaPhoto(photo, caption=text, parse_mode=HTML)
-    elif video:
-        media = InputMediaVideo(video, caption=text, parse_mode=HTML, supports_streaming=True)
-
-    try:
-        if media:
-            await msg.edit_media(media, reply_markup=markup)
-            return
-        if msg.text:
-            await msg.edit_text(text, reply_markup=markup, parse_mode=HTML, disable_web_page_preview=True)
-            return
-    except MessageNotModified:
-        return
-    except Exception:
-        logger.info("In-place edit failed — sending a fresh message", exc_info=True)
-
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-    await _reply_media(msg, text, markup, photo=photo, video=video, quote=False)
-
-
-def _start_text(user) -> str:
-    return START_TXT.format(mention=user.mention if user else "there")
-
-
-async def _send_support_welcome(message, mention: str):
-    """The support group's own welcome: its text, a custom photo when one is set (text only when
-    not), and the Main Group / Owner buttons underneath."""
-    settings = await get_settings()
-    photo = (settings.get("support_welcome_photo") or SUPPORT_WELCOME_PHOTO or "").strip() or None
-    text = (
-        SUPPORT_WELCOME_TXT
-        .replace("{mention}", mention)
-        .replace("{chat}", html.escape(message.chat.title or "the group"))
-    )
-    return await _reply_media(message, text, build_markup(SUPPORT_WELCOME_BUTTONS), photo=photo, quote=False)
-
-
-@Client.on_message(filters.command("setsupportphoto") & filters.user(ADMINS))
-async def set_support_photo(_, message):
-    reply = message.reply_to_message
-    if not reply or not reply.photo:
-        await message.reply_text("Reply to a <b>photo</b> with /setsupportphoto to use it in the support group welcome.")
-        return
-    await update_settings({"support_welcome_photo": reply.photo.file_id})
-    await message.reply_text("✅ Support group welcome photo saved.")
-
-
-@Client.on_message(filters.command("delsupportphoto") & filters.user(ADMINS))
-async def del_support_photo(_, message):
-    await update_settings({"support_welcome_photo": ""})
-    await message.reply_text("✅ Support group welcome photo removed — the welcome is text only now.")
-
-
-async def send_start(message):
-    """Welcome video + text + buttons. Same message for /start in DM and in groups;
-    groups get link-only buttons (callbacks would let anyone edit a group message).
-    The support group gets its own welcome instead."""
-    private = message.chat.type == enums.ChatType.PRIVATE
-    if not private and is_support_chat(message.chat):
-        user = message.from_user
-        await _send_support_welcome(message, user.mention if user else "there")
-        return
-    layout = START_BUTTONS if private else WELCOME_BUTTONS
-    await _reply_media(
-        message, _start_text(message.from_user), build_markup(layout),
-        video=WELCOME_VIDEO, quote=False,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /start
-# ══════════════════════════════════════════════════════════════════════════════
-
-@Client.on_message(filters.command("start"))
-async def start_cmd(bot, message):
-    if message.chat.type != enums.ChatType.PRIVATE:
-        # In a group: the welcome video + text (file / verify deep links only run in DM).
-        await send_start(message)
-        return
-
-    await register_user(message.from_user)
-
-    args = message.text.split(maxsplit=1)
-    payload = args[1] if len(args) > 1 else ""
-
-    if payload.startswith("file_"):
-        await deliver_file(bot, message.from_user.id, payload[len("file_"):])
-        return
-
-    if payload.startswith("notcopy_"):
-        await handle_notcopy(bot, message, payload[len("notcopy_"):])
-        return
-
-    if payload.startswith("sgfile-"):
-        # Get Files button from the support group: exactly what typing these words in the
-        # bot DM does (title menu when several titles match, files, relaxed season search...).
-        from plugins.search import handle_search
-
-        search_query = payload[len("sgfile-"):].replace("-", " ").strip()
-        if search_query:
-            message.text = search_query
-            await handle_search(bot, message, from_deep_link=True)
-        else:
-            await send_start(message)
-        return
-
-    if payload.startswith("getfile-"):
-        # Deep link from a /m movie-update post: run the normal search flow
-        # (poster, pagination, season/language/quality filters).
-        import html
-        from database.filters_db import search_files
-        from plugins.search import _deliver_results
-
-        search_query = payload[len("getfile-"):].replace("-", " ").strip()
-        results = await search_files(search_query) if search_query else []
-        if results:
-            await _deliver_results(message, search_query, results)
-        else:
-            await message.reply_text(f"❌ No results found for <b>{html.escape(search_query)}</b>.")
-        return
-
-    await send_start(message)
-
-
-@Client.on_message(filters.command("help"))
-async def help_cmd(_, message):
-    await message.reply_text(HELP_TXT)
-
-
-@Client.on_message(filters.command("myplan"))
-async def myplan_cmd(_, message):
-    if not message.from_user:  # anonymous group admin
-        return
-    doc = await get_premium(message.from_user.id)
-    if doc:
-        expiry = doc["expiry_time"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        await message.reply_text(MYPLAN_ACTIVE_TXT.format(expiry=expiry))
-    else:
-        await message.reply_text(MYPLAN_NONE_TXT)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Welcome new members — playable video + mention (groups where the bot is admin)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_LAST_WELCOME: dict = {}        # chat_id -> message id of the previous welcome
-_tasks: set = set()             # keep references so background deletes aren't GC'd
-
-
-async def _delete_later(message, seconds: int):
-    await asyncio.sleep(seconds)
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
-@Client.on_message(filters.new_chat_members & filters.group)
-async def welcome_new_members(bot, message):
-    try:
-        settings = await get_settings()
-        if not settings.get("welcome_enabled", True):
-            return
-
-        members = [u for u in (message.new_chat_members or []) if not u.is_bot]
-        if not members:        # the bot itself (or other bots) joined
-            return
-
-        mention = ", ".join(u.mention for u in members[:5])
-        if len(members) > 5:
-            mention += f" +{len(members) - 5}"
-        if is_support_chat(message.chat):
-            sent = await _send_support_welcome(message, mention)
-        else:
-            text = (
-                GROUP_WELCOME_TXT
-                .replace("{mention}", mention)
-                .replace("{chat}", html.escape(message.chat.title or "the group"))
-            )
-            sent = await _reply_media(
-                message, text, build_markup(WELCOME_BUTTONS), video=WELCOME_VIDEO, quote=False,
-            )
-
-        # keep the chat clean: drop the previous welcome, and expire this one
-        prev = _LAST_WELCOME.get(message.chat.id)
-        if prev:
-            try:
-                await bot.delete_messages(message.chat.id, prev)
-            except Exception:
-                pass
-        _LAST_WELCOME[message.chat.id] = sent.id
-        if WELCOME_DELETE_AFTER > 0:
-            task = asyncio.create_task(_delete_later(sent, WELCOME_DELETE_AFTER))
-            _tasks.add(task)
-            task.add_done_callback(_tasks.discard)
-    except Exception:
-        logger.warning("welcome_new_members failed", exc_info=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Premium page (callback "premium") — photo + PREMIUM_TEXT (strings.py) + Owner / Back
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _premium_markup() -> InlineKeyboardMarkup:
-    top = [InlineKeyboardButton(PREMIUM_MYPLAN_BTN, callback_data="premium_myplan")]
-    if OWNER_LINK:
-        top.insert(0, InlineKeyboardButton(PREMIUM_OWNER_BTN, url=OWNER_LINK))
-    return InlineKeyboardMarkup([top, [InlineKeyboardButton(PREMIUM_BACK_BTN, callback_data="start_back")]])
-
-
-@Client.on_callback_query(filters.regex(r"^premium$"))
-async def premium_page(bot, query):
-    await query.answer()
-    await _swap_message(bot, query, PREMIUM_TEXT, _premium_markup(), photo=PREMIUM_PHOTO or None)
-
-
-@Client.on_callback_query(filters.regex(r"^start_back$"))
-async def back_to_start(bot, query):
-    await query.answer()
-    await _swap_message(
-        bot, query, _start_text(query.from_user), build_markup(START_BUTTONS),
-        video=WELCOME_VIDEO or None,
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^premium_myplan$"))
-async def premium_myplan(_, query):
-    doc = await get_premium(query.from_user.id)
-    if doc:
-        expiry = doc["expiry_time"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        await query.answer(MYPLAN_ALERT_ACTIVE.format(expiry=expiry), show_alert=True)
-    else:
-        await query.answer(MYPLAN_ALERT_NONE, show_alert=True)

@@ -57,6 +57,15 @@ async def auto_index(_, message):
         logger.warning("Auto-index failed for message %s in %s", message.id, message.chat.id)
 
 
+@Client.on_edited_message(index_channel_filter & (filters.document | filters.video))
+async def auto_reindex_edited(_, message):
+    """An admin edited the caption of an indexed post: refresh the stored caption right away
+    (save_file only writes when something actually changed)."""
+    media = _extract_media(message)
+    if media:
+        await save_file(media, channel_id=message.chat.id)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MANUAL INDEX — admin walks the bot through backfilling a whole channel
 # ══════════════════════════════════════════════════════════════════════════════

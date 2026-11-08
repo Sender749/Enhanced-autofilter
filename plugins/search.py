@@ -16,7 +16,7 @@ from database.filters_db import (
     search_files, display_name, extract_meta, apply_filters, is_language_year_query, clean_display_text,
     related_titles, relaxed_search, parse_query,
 )
-from database.alias_db import alias_key, create_miss, set_miss_message
+from database.alias_db import alias_key, alias_query, create_miss, set_miss_message
 from plugins.learn import note_miss, note_success, note_tap
 from database.query_log_db import log_query
 from database.settings_db import get_settings
@@ -894,6 +894,18 @@ async def handle_search(bot, message, from_deep_link: bool = False):
             _log("relaxed", len(relaxed["results"]), relaxed["title"])
             await _deliver_relaxed(message, status, query, relaxed, settings)
             return
+
+    # An admin-approved alias ("50 shades" -> "fifty shades") already worked in the exact-title
+    # search above. It must also steer the later stages — phrase search, typo fixer, related titles
+    # and suggestions — otherwise a title that only matches as a PHRASE ("Fifty Shades of Grey")
+    # is never found through the alias. The alias version is tried first.
+    alias_variants, seen_variants = [], {v.lower() for v in variants}
+    for v in variants:
+        aliased = await alias_query(v)
+        if aliased and aliased.lower() not in seen_variants:
+            seen_variants.add(aliased.lower())
+            alias_variants.append(aliased)
+    variants = alias_variants + variants
 
     # Phrase search — titles that ARE, START WITH or CONTAIN the words, spelling-
     # proof (Bahubali = Baahubali). One title -> its files; several -> title buttons.

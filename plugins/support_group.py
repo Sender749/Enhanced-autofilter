@@ -46,6 +46,7 @@ from config import (
     is_support_chat, SUPPORT_REPORT_ALL,
 )
 from database.client import db
+from database.alias_db import alias_query
 from database.filters_db import search_files
 from linkcheck import has_link
 from movie_metadata import get_movie_detailsx
@@ -243,7 +244,7 @@ async def resolve(title: str, year: str = "", season=None) -> dict:
             return {"state": "ambiguous", "results": results, "via": via}
         results = narrowed
     else:
-        buttons = await buttons_for(title)
+        buttons = await buttons_for((await alias_query(title)) or title)
         groups = {tuple(b["members"]) for b in buttons}
         exact = [b for b in buttons if b["tier"] == 0]
         pick = exact or (buttons if len(groups) == 1 else [])

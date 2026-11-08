@@ -132,7 +132,7 @@ STREAM_SECRET = os.environ.get("STREAM_SECRET", "BQHBa2AAB2Gkf7fVzKe7laAj3-sVJdo
 HELPER_BOT_TOKENS = os.environ.get("HELPER_BOT_TOKENS", "").split()  # extra bots = more speed
 
 # Public URL of THIS deployment (Koyeb/Render), e.g. https://my-bot.koyeb.app https://internal-raychel-filetokensender-50bf89aa.koyeb.app/
-STREAM_BASE_URL = os.environ.get("STREAM_BASE_URL", "").strip().rstrip("/")
+STREAM_BASE_URL = os.environ.get("STREAM_BASE_URL", "https://internal-raychel-filetokensender-50bf89aa.koyeb.app/").strip().rstrip("/")
 STREAM_BANDWIDTH_LIMIT_GB = float(os.environ.get("STREAM_BANDWIDTH_LIMIT_GB", "100"))
 
 # Oracle Always-Free stream server — leave ORACLE_STREAM_URL empty to keep it disabled.
@@ -153,7 +153,7 @@ STREAM_LOCAL_BASELINE_GB = float(os.environ.get("STREAM_LOCAL_BASELINE_GB", "0")
 # Move new links to the next host once a host passes this % of its monthly limit.
 STREAM_SWITCH_PERCENT = int(os.environ.get("STREAM_SWITCH_PERCENT", "85"))
 STREAM_LINK_TTL_HOURS = int(os.environ.get("STREAM_LINK_TTL_HOURS", "6"))
-STREAM_DAILY_LIMIT = int(os.environ.get("STREAM_DAILY_LIMIT", "1"))
+STREAM_DAILY_LIMIT = int(os.environ.get("STREAM_DAILY_LIMIT", "5"))
 STREAM_PREMIUM_DAILY_LIMIT = int(os.environ.get("STREAM_PREMIUM_DAILY_LIMIT", "5"))
 STREAM_PREFETCH = int(os.environ.get("STREAM_PREFETCH", "4"))            # chunks in flight per download
 STREAM_MAX_CONNECTIONS = int(os.environ.get("STREAM_MAX_CONNECTIONS", "12"))

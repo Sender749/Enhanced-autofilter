@@ -28,7 +28,9 @@ from collections import Counter, defaultdict
 
 from database.filters_db import (
     clean_title, display_name, files, parse_query, title_key_variants, search_by_title_keys,
+    _season_of, _episode_of, _episode_range_of,
 )
+from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ def pretty(title: str) -> str:
 
 class Group:
     """One title, however it is spelled in the captions."""
-    __slots__ = ("gt", "st", "names", "members", "n", "years")
+    __slots__ = ("gt", "st", "names", "members", "n", "years", "seasons", "series")
 
     def __init__(self, gt, st):
         self.gt, self.st = gt, st
@@ -85,6 +87,8 @@ class Group:
         self.members: set = set()
         self.n = 0
         self.years: Counter = Counter()
+        self.seasons: Counter = Counter()   # season number -> files (series only)
+        self.series = 0                     # files that are episodes / seasons
 
     @property
     def title(self) -> str:
@@ -114,12 +118,19 @@ def _scan_batch(batch: list, titles: dict):
             continue
         t = titles.get(key)
         if t is None:
-            t = titles[key] = {"n": 0, "names": Counter(), "years": Counter()}
+            t = titles[key] = {"n": 0, "names": Counter(), "years": Counter(),
+                               "seasons": Counter(), "series": 0}
         t["n"] += 1
         t["names"][title] += 1
         y = _doc_year(doc)
         if y:
             t["years"][y] += 1
+        text = display_name(doc)
+        season = _season_of(text)
+        if season or _episode_of(text) or _episode_range_of(text):
+            t["series"] += 1
+            if season:
+                t["seasons"][season] += 1
 
 
 def _assemble(titles: dict) -> dict:
@@ -137,6 +148,8 @@ def _assemble(titles: dict) -> dict:
         g.n += t["n"]
         g.names.update(t["names"])
         g.years.update(t["years"])
+        g.seasons.update(t.get("seasons", ()))
+        g.series += t.get("series", 0)
 
     inv_g, inv_s = defaultdict(list), defaultdict(list)
     first_g, first_s = defaultdict(list), defaultdict(list)
@@ -282,12 +295,39 @@ async def title_groups(query: str) -> list:
 
 # ── buttons ─────────────────────────────────────────────────────────────────
 
+def season_label(seasons) -> str:
+    """[1, 2, 3, 4, 5] -> "Season 1-5" · [2] -> "Season 2" · [1, 3, 4] -> "Seasons 1, 3-4"."""
+    nums = sorted({int(x) for x in seasons if x})
+    if not nums:
+        return ""
+    runs, start, prev = [], nums[0], nums[0]
+    for x in nums[1:]:
+        if x == prev + 1:
+            prev = x
+            continue
+        runs.append((start, prev))
+        start = prev = x
+    runs.append((start, prev))
+    text = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+    if len(nums) == 1:
+        return f"Season {nums[0]}"
+    return f"Season {text}" if len(runs) == 1 else f"Seasons {text}"
+
+
 def group_buttons(tier: int, group: Group) -> list:
     """The button(s) for one title. A title whose files fall into two or more
     years with 2+ files each (Gadar 2001 / Gadar 2023, remakes) becomes one
-    button per year; files with an odd or no year stay with the biggest year."""
+    button per year; files with an odd or no year stay with the biggest year.
+    A SERIES gets one button that shows its seasons instead of a year ("Season 1-5")."""
     title = group.title
     members = sorted(group.members)[:40]
+    # Files that carry a season (S01E05, "Season 2" ...) -> the button shows the seasons instead of a
+    # year. Files with only a year stay "(2023)". Episodes with no season number and no year -> "Series".
+    if group.seasons or (group.series and group.series * 2 >= group.n and not group.years):
+        label = season_label(group.seasons) or "Series"
+        return [{"title": title, "members": members, "years": None, "split": [], "other": True,
+                 "n": group.n, "year_label": "", "season_label": label, "seasons": sorted(group.seasons),
+                 "tier": tier}]
     split = sorted(y for y, c in group.years.items() if c >= 2)
     if len(split) >= 2:
         main = max(split, key=lambda y: group.years[y])
@@ -303,15 +343,77 @@ def group_buttons(tier: int, group: Group) -> list:
 
 
 def button_label(btn: dict) -> str:
-    year = f" ({btn['year_label']})" if btn["year_label"] else ""
-    return f"{btn['title']}{year} · {btn['n']} files"
+    extra = btn.get("season_label") or btn.get("year_label")
+    return f"{btn['title']}{f' ({extra})' if extra else ''} · {btn['n']} files"
+
+
+# ── near-duplicate titles ───────────────────────────────────────────────────
+# "The Last Kingdom" / "Last Kingdom", "Mr. Bean's Holiday" / "Mr Beans Holiday" written two
+# ways in the captions: same year (movies) and an almost identical title -> ONE button.
+# Numbers never merge ("Weak Hero Class 1" / "2").
+
+_SIMILAR_PERCENT = 90
+_ROMAN = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"}
+
+
+def _sim_form(title: str):
+    toks = tokens(title)
+    if len(toks) > 1 and toks[0] in ("the", "a", "an"):
+        toks = toks[1:]
+    return toks
+
+
+def _almost_same(t1: str, t2: str) -> bool:
+    a, b = _sim_form(t1), _sim_form(t2)
+    if not a or not b:
+        return False
+    num = lambda toks: sorted(w for w in toks if w.isdigit() or w in _ROMAN)
+    if num(a) != num(b):
+        return False
+    return fuzz.ratio(" ".join(a), " ".join(b)) >= _SIMILAR_PERCENT
+
+
+def _merge_into(a: dict, b: dict) -> None:
+    """Fold button b into button a (a keeps the title of the bigger one)."""
+    if b["n"] > a["n"]:
+        a["title"] = b["title"]
+    a["members"] = sorted(set(a["members"]) | set(b["members"]))[:40]
+    a["n"] += b["n"]
+    a["tier"] = min(a["tier"], b["tier"])
+    if a.get("season_label") is not None and b.get("season_label") is not None:
+        a["seasons"] = sorted(set(a.get("seasons", [])) | set(b.get("seasons", [])))
+        a["season_label"] = season_label(a["seasons"]) or "Series"
+    elif a["years"] is not None:
+        a["split"] = sorted(set(a["split"]) | set(b["split"]))
+        a["other"] = a["other"] or b["other"]
+
+
+def merge_similar(buttons: list) -> list:
+    out = []
+    for b in buttons:
+        target = None
+        for a in out:
+            same_kind = (a.get("season_label") is not None) == (b.get("season_label") is not None)
+            if not same_kind:
+                continue
+            if a.get("season_label") is None:      # movies: same year (or both without one)
+                if a["year_label"] != b["year_label"] or (a["years"] is None) != (b["years"] is None):
+                    continue
+            if _almost_same(a["title"], b["title"]):
+                target = a
+                break
+        if target is None:
+            out.append(dict(b))
+        else:
+            _merge_into(target, b)
+    return out
 
 
 async def buttons_for(query: str) -> list:
     out = []
     for tier, group in await title_groups(query):
         out.extend(group_buttons(tier, group))
-    return out
+    return merge_similar(out)
 
 
 async def files_for_button(btn: dict) -> list:

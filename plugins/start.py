@@ -10,10 +10,11 @@ from pyrogram.types import (
 
 from config import (
     WELCOME_VIDEO, START_BUTTONS, WELCOME_BUTTONS, GROUP_WELCOME_TXT,
-    WELCOME_DELETE_AFTER, PREMIUM_PHOTO, OWNER_LINK,
+    WELCOME_DELETE_AFTER, PREMIUM_PHOTO, OWNER_LINK, ADMINS,
+    SUPPORT_WELCOME_TXT, SUPPORT_WELCOME_PHOTO, SUPPORT_WELCOME_BUTTONS, is_support_chat,
 )
 from database.premium_db import get_premium
-from database.settings_db import get_settings
+from database.settings_db import get_settings, update_settings
 from log_utils import register_user
 from plugins.deliver import deliver_file
 from plugins.verify import handle_notcopy
@@ -116,10 +117,44 @@ def _start_text(user) -> str:
     return START_TXT.format(mention=user.mention if user else "there")
 
 
+async def _send_support_welcome(message, mention: str):
+    """The support group's own welcome: its text, a custom photo when one is set (text only when
+    not), and the Main Group / Owner buttons underneath."""
+    settings = await get_settings()
+    photo = (settings.get("support_welcome_photo") or SUPPORT_WELCOME_PHOTO or "").strip() or None
+    text = (
+        SUPPORT_WELCOME_TXT
+        .replace("{mention}", mention)
+        .replace("{chat}", html.escape(message.chat.title or "the group"))
+    )
+    return await _reply_media(message, text, build_markup(SUPPORT_WELCOME_BUTTONS), photo=photo, quote=False)
+
+
+@Client.on_message(filters.command("setsupportphoto") & filters.user(ADMINS))
+async def set_support_photo(_, message):
+    reply = message.reply_to_message
+    if not reply or not reply.photo:
+        await message.reply_text("Reply to a <b>photo</b> with /setsupportphoto to use it in the support group welcome.")
+        return
+    await update_settings({"support_welcome_photo": reply.photo.file_id})
+    await message.reply_text("✅ Support group welcome photo saved.")
+
+
+@Client.on_message(filters.command("delsupportphoto") & filters.user(ADMINS))
+async def del_support_photo(_, message):
+    await update_settings({"support_welcome_photo": ""})
+    await message.reply_text("✅ Support group welcome photo removed — the welcome is text only now.")
+
+
 async def send_start(message):
     """Welcome video + text + buttons. Same message for /start in DM and in groups;
-    groups get link-only buttons (callbacks would let anyone edit a group message)."""
+    groups get link-only buttons (callbacks would let anyone edit a group message).
+    The support group gets its own welcome instead."""
     private = message.chat.type == enums.ChatType.PRIVATE
+    if not private and is_support_chat(message.chat):
+        user = message.from_user
+        await _send_support_welcome(message, user.mention if user else "there")
+        return
     layout = START_BUTTONS if private else WELCOME_BUTTONS
     await _reply_media(
         message, _start_text(message.from_user), build_markup(layout),
@@ -229,15 +264,17 @@ async def welcome_new_members(bot, message):
         mention = ", ".join(u.mention for u in members[:5])
         if len(members) > 5:
             mention += f" +{len(members) - 5}"
-        text = (
-            GROUP_WELCOME_TXT
-            .replace("{mention}", mention)
-            .replace("{chat}", html.escape(message.chat.title or "the group"))
-        )
-
-        sent = await _reply_media(
-            message, text, build_markup(WELCOME_BUTTONS), video=WELCOME_VIDEO, quote=False,
-        )
+        if is_support_chat(message.chat):
+            sent = await _send_support_welcome(message, mention)
+        else:
+            text = (
+                GROUP_WELCOME_TXT
+                .replace("{mention}", mention)
+                .replace("{chat}", html.escape(message.chat.title or "the group"))
+            )
+            sent = await _reply_media(
+                message, text, build_markup(WELCOME_BUTTONS), video=WELCOME_VIDEO, quote=False,
+            )
 
         # keep the chat clean: drop the previous welcome, and expire this one
         prev = _LAST_WELCOME.get(message.chat.id)

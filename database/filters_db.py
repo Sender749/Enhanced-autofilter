@@ -115,14 +115,26 @@ async def save_file(media, channel_id: int | None = None) -> str:
     except DuplicateKeyError:
         # Same file re-posted or re-indexed. If the caption changed, keep it
         # fresh — captions are edited more often than files are re-uploaded.
-        existing = await files.find_one({"file_unique_id": file_unique_id}, {"caption": 1})
-        if existing is not None and existing.get("caption", "") != caption:
-            await files.update_one(
-                {"file_unique_id": file_unique_id},
-                {"$set": {"caption": caption, "file_name": file_name, "words": words, "tkeys": tkeys, "tkv": KEY_VERSION}},
-            )
-            return "updated"
-        return "duplicate"
+        existing = await files.find_one(
+            {"file_unique_id": file_unique_id},
+            {"caption": 1, "file_name": 1, "file_id": 1, "file_size": 1, "channel_id": 1, "tkv": 1},
+        )
+        if existing is None:
+            return "duplicate"
+        # Anything an admin can change by editing the post and re-indexing it: the caption, the
+        # file name, and the file_id / size / channel the file is delivered from. (A stale
+        # file_id would make the file undeliverable.) Title keys are rebuilt with the caption.
+        fresh = {
+            "caption": caption, "file_name": file_name, "file_id": doc["file_id"],
+            "file_size": doc["file_size"], "channel_id": channel_id,
+        }
+        if all(existing.get(k) == v for k, v in fresh.items()) and existing.get("tkv") == KEY_VERSION:
+            return "duplicate"
+        await files.update_one(
+            {"file_unique_id": file_unique_id},
+            {"$set": {**fresh, "words": words, "tkeys": tkeys, "tkv": KEY_VERSION, "indexed_at": time.time()}},
+        )
+        return "updated"
     except Exception:
         logger.exception("save_file failed for %s", file_name)
         return "error"

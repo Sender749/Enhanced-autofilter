@@ -55,6 +55,7 @@ async def ensure_indexes():
     await titles.create_index([("words", ASCENDING)], name="t_words_idx")
     await titles.create_index([("kind", ASCENDING), ("last_indexed_at", DESCENDING)], name="t_kind_idx")
     await titles.create_index([("meta_status", ASCENDING), ("last_indexed_at", DESCENDING)], name="t_meta_idx")
+    await titles.create_index([("lead_lang", ASCENDING), ("last_indexed_at", DESCENDING)], name="t_lead_idx")
 
 
 # ── sync: files -> items + titles ───────────────────────────────────────────
@@ -74,7 +75,7 @@ async def _refresh_titles(tkeys: list):
             "_id": "$tkey", "n": {"$sum": 1}, "name": {"$first": "$name"}, "year": {"$max": "$year"},
             "series": {"$sum": {"$cond": ["$is_series", 1, 0]}}, "anime": {"$max": "$anime"},
             "seasons": {"$addToSet": "$season"}, "q": {"$addToSet": "$quality"},
-            "langs": {"$push": "$langs"},
+            "langs": {"$push": "$langs"}, "leads": {"$push": "$lead"},
             "first": {"$min": "$indexed_at"}, "last": {"$max": "$indexed_at"},
         }},
     ]
@@ -86,8 +87,10 @@ async def _refresh_titles(tkeys: list):
         kind = "anime" if ((g.get("anime") or g["_id"] in anime_meta) and is_series) else ("series" if is_series else "movie")
         qs = sorted({q for q in g["q"] if q}, key=lambda x: -int(x[:-1]))
         seasons = sorted(s for s in g["seasons"] if s is not None)
+        leads = [x for x in g["leads"] if x]
+        lead_lang = max(set(leads), key=leads.count) if leads else None
         set_doc = {
-            "kind": kind, "file_count": g["n"], "seasons": seasons, "langs": langs, "qualities": qs,
+            "lead_lang": lead_lang, "kind": kind, "file_count": g["n"], "seasons": seasons, "langs": langs, "qualities": qs,
             "first_indexed_at": g["first"], "last_indexed_at": g["last"],
         }
         on_insert = {"name": g["name"], "year": g["year"], "words": sorted(set(tokens(g["name"]))),
@@ -129,7 +132,7 @@ async def sync(full: bool = False, batch: int = 1000, rematch: bool = False) -> 
             ops.append(ReplaceOne({"_id": doc["_id"]}, {
                 "tkey": k, "name": p["title"], "year": p["year"], "is_series": p["is_series"], "anime": p["anime"],
                 "season": p["season"], "ep_from": p["ep_from"], "ep_to": p["ep_to"], "pack": p["pack"],
-                "bonus": p["bonus"], "quality": p["quality"], "langs": p["langs"],
+                "bonus": p["bonus"], "quality": p["quality"], "langs": p["langs"], "lead": p["lead"],
                 "size": doc.get("file_size") or 0, "label": name[:200],
                 "mime": doc.get("mime_type") or "", "indexed_at": doc.get("indexed_at") or 0,
             }, upsert=True))

@@ -26,9 +26,9 @@ from config import (
 from database.filters_db import get_file_by_id, display_name
 from database.premium_db import has_premium_access
 from database.request_db import add_request
-from database.stream_db import get_bin_entry, get_daily, increment_daily
+from database.stream_db import get_bin_entry, add_usage, get_daily, increment_daily
 from database import trending_db
-from fastdl.hosts import choose_host, note_link_issued
+from fastdl.hosts import choose_host
 from fastdl.links import build_url, is_video
 from utils import temp
 from webapp.auth import validate_init_data
@@ -85,8 +85,8 @@ def _categories() -> dict:
         "movies": ("Movies", {"kind": "movie"}, "last_indexed_at"),
         "series": ("Web series", {"kind": "series"}, "last_indexed_at"),
         "anime": ("Anime", {"kind": "anime"}, "last_indexed_at"),
-        "hindi": ("Hindi", {"langs": "hindi"}, "last_indexed_at"),
-        "punjabi": ("Punjabi", {"langs": "punjabi"}, "last_indexed_at"),
+        "hindi": ("Hindi", {"lead_lang": "hindi"}, "last_indexed_at"),
+        "punjabi": ("Punjabi", {"lead_lang": "punjabi"}, "last_indexed_at"),
     }
 
 
@@ -222,7 +222,7 @@ async def search(request):
     if kind in ("movie", "series", "anime"):
         flt["kind"] = kind
     if lang:
-        flt["langs"] = lang.lower()
+        flt["lead_lang"] = lang.lower()
     if year and year.isdigit():
         flt["year"] = year
     if quality:
@@ -267,7 +267,8 @@ def _qkey(f: dict) -> int:
 def _best(its: list) -> list:
     """Good prints only, one file per quality.
     1) keep only the best print tier present (a WEB-DL/BluRay title hides its HDRip/CAM copies;
-       if only CAM-type prints exist they are all kept so the title isn't empty);
+       if only CAM-type prints exist they are all kept so the title isn't empty), then fill any
+       quality that tier lacks from the best lower non-CAM print;
     2) per quality (480p, 720p, 1080p ...) keep one file: best print, then more audio languages, then larger."""
     if not its:
         return []
@@ -275,11 +276,20 @@ def _best(its: list) -> list:
     top = max(r for r, _ in ranked)
     keep = [(r, i) for r, i in ranked if top <= 30 or r >= top - 15]
     by_q: dict = {}
-    for r, i in keep:
-        score = (r, len(i.get("langs") or []), i.get("size") or 0)
-        k = i.get("quality") or "?"
-        if k not in by_q or score > by_q[k][0]:
-            by_q[k] = (score, i)
+
+    def add(pool):
+        for r, i in pool:
+            score = (r, len(i.get("langs") or []), i.get("size") or 0)
+            k = i.get("quality") or "?"
+            if k not in by_q or score > by_q[k][0]:
+                by_q[k] = (score, i)
+
+    add(keep)
+    if top > 30:
+        # A quality the good prints don't have (e.g. only an HDRip 480p) is filled from the best
+        # lower non-CAM print, so users still get a 480p option.
+        have = set(by_q)
+        add([(r, i) for r, i in ranked if 30 < r < top - 15 and (i.get("quality") or "?") not in have])
     return sorted((_file(i) for _, i in by_q.values()), key=_qkey)
 
 
@@ -369,7 +379,7 @@ async def link(request):
             "stream": f"{host.base_url}/stream/{token}/{qname}" if video else None,
             "watch": f"{host.base_url}/watch/{token}/{qname}" if video else None,
         }
-        await note_link_issued(host, size)
+        await add_usage(host.key, size)
         await increment_daily(user["id"])
         u = SimpleNamespace(id=user["id"], first_name=user.get("first_name", ""), last_name=user.get("last_name", ""),
                             username=user.get("username"))

@@ -153,6 +153,8 @@ def parse(raw):
     low = re.sub(r"\b(%s)\s*(e?subs?|subtitles?)\b" % alt, " ", low)          # "English Subs"
     low = re.sub(r"\b(e?subs?|subtitles?)\s*[:\-\[\(]?\s*(%s)\b" % alt, " ", low)  # "ESub English"
     r["langs"] = [l for l in LANGS if re.search(r"\b" + l + r"\b", low)]
+    pos = {l: re.search(r"\b" + l + r"\b", low).start() for l in r["langs"]}
+    r["lead"] = min(pos, key=pos.get) if pos else None   # first language named = the audio the file leads with
     r["rank"] = print_rank(t)
     r["is_series"] = bool(r["season"] or r["ep_from"] or r["pack"] or re.search(r"web series", t, re.I) or r["seasons"])
     r["anime"] = bool(re.search(r"\banime\b", t, re.I))

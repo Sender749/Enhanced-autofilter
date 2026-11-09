@@ -186,7 +186,7 @@ WEBAPP_SYNC_SECONDS = int(os.environ.get("WEBAPP_SYNC_SECONDS", "600"))  # how o
 
 # ── AdsGram rewarded-ad verification (webapp/adverify.py) ───────────────────
 # ADSGRAM_BLOCK_ID = the Reward ad unit's id from partner.adsgram.ai ("<> Show code" -> Copy BlockID).
-ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "").strip().strip("\"'").strip()  # digits only, e.g. 12345
+ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "58841").strip().strip("\"'").strip()  # digits only, e.g. 12345
 # Secret inside the Reward URL so only AdsGram can confirm a watched ad. Empty = made from BOT_TOKEN.
 ADSGRAM_SECRET = os.environ.get("ADSGRAM_SECRET", "").strip() or hashlib.sha256(f"adsgram|{BOT_TOKEN}".encode()).hexdigest()[:24]
 # True = a user is verified only after AdsGram's server also confirms the ad (needs the Reward URL set in

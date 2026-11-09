@@ -13,6 +13,7 @@ Each tier uses its own shortener (settings_db.shorteners), so a user who
 keeps requesting files throughout the day cycles through progressively
 later tiers rather than being asked to verify from scratch every time.
 """
+import asyncio
 import logging
 import random
 import string
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 verify_status_col = db["verify_status"]
 verify_tokens_col = db["verify_tokens"]
+ad_rewards_col = db["ad_rewards"]   # AdsGram "ad watched" confirmations, waiting to be used
 
 _TOKEN_TTL = timedelta(minutes=30)
 
@@ -43,6 +45,7 @@ def _ist_midnight_utc(now_utc: datetime) -> datetime:
 
 async def ensure_indexes():
     await verify_tokens_col.create_index("created_at", expireAfterSeconds=int(_TOKEN_TTL.total_seconds()))
+    await ad_rewards_col.create_index("created_at", expireAfterSeconds=900)
 
 
 async def _get_status(user_id: int) -> dict:
@@ -122,3 +125,41 @@ async def consume_token(token: str, user_id: int) -> dict | None:
         {"$set": {"used": True}},
     )
     return doc
+
+
+async def peek_token(token: str, user_id: int) -> dict | None:
+    """Look at a token WITHOUT using it (the ad page checks it before and after the ad)."""
+    return await verify_tokens_col.find_one({"_id": token, "user_id": user_id, "used": False})
+
+
+# ── AdsGram: "this user watched an ad" confirmations ─────────────────────────
+# AdsGram's server calls our /adsgram/reward link once per watched ad. Each call adds 1;
+# each verification uses 1, so one ad can never unlock two files.
+
+async def record_ad_reward(user_id: int):
+    await ad_rewards_col.update_one(
+        {"_id": user_id},
+        {"$inc": {"n": 1}, "$set": {"created_at": _now()}},
+        upsert=True,
+    )
+
+
+async def consume_ad_reward(user_id: int) -> bool:
+    doc = await ad_rewards_col.find_one_and_update(
+        {"_id": user_id, "n": {"$gt": 0}},
+        {"$inc": {"n": -1}},
+    )
+    return bool(doc)
+
+
+async def wait_ad_reward(user_id: int, timeout: float) -> bool:
+    """The page's "ad finished" and AdsGram's server call can arrive in either order —
+    wait a few seconds for the confirmation instead of failing at once."""
+    waited = 0.0
+    while True:
+        if await consume_ad_reward(user_id):
+            return True
+        if waited >= timeout:
+            return False
+        await asyncio.sleep(0.5)
+        waited += 0.5

@@ -26,6 +26,7 @@ DEFAULTS = {
     "fsub_channels": [],          # list[int] channel ids
     "premium_enabled": True,
     "verify_enabled": False,
+    "verify_mode": "shortener",       # "shortener" | "ad" (AdsGram rewarded ad, see webapp/adverify.py)
     "result_mode": "button",      # "button" | "text"
     "verify_time": 8 * 3600,          # tier 1 -> tier 2 gap, seconds
     "third_verify_time": 8 * 3600,    # tier 2 -> tier 3 gap, seconds

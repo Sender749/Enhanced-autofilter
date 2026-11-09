@@ -2,7 +2,7 @@
 import asyncio
 import logging
 
-from config import WEBAPP_ENABLED, WEBAPP_URL, WEBAPP_SYNC_SECONDS, STREAM_ONLY
+from config import WEBAPP_ENABLED, WEBAPP_URL, WEBAPP_SYNC_SECONDS, STREAM_ONLY, ADSGRAM_ENABLED
 
 logger = logging.getLogger(__name__)
 _task = None
@@ -12,6 +12,9 @@ def register_routes(app):
     if WEBAPP_ENABLED and not STREAM_ONLY:  # the stream-only host has no bot to deliver files
         from webapp.api import register_routes as _reg
         _reg(app)
+    if ADSGRAM_ENABLED:  # rewarded-ad verification page + AdsGram's reward callback
+        from webapp.adverify import register_routes as _reg_ads
+        _reg_ads(app)
 
 
 async def start(bot):

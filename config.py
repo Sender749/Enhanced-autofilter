@@ -191,7 +191,7 @@ ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "58841").strip()
 ADSGRAM_SECRET = os.environ.get("ADSGRAM_SECRET", "").strip() or hashlib.sha256(f"adsgram|{BOT_TOKEN}".encode()).hexdigest()[:24]
 # True = a user is verified only after AdsGram's server also confirms the ad (needs the Reward URL set in
 # AdsGram). Set false only while testing on an AdsGram *Test platform* (it sends no confirmation).
-ADSGRAM_REQUIRE_REWARD = _bool("ADSGRAM_REQUIRE_REWARD", false)
+ADSGRAM_REQUIRE_REWARD = _bool("ADSGRAM_REQUIRE_REWARD", False)
 ADSGRAM_WAIT_SECONDS = int(os.environ.get("ADSGRAM_WAIT_SECONDS", "12"))  # how long to wait for that confirmation
 ADSGRAM_ENABLED = bool(ADSGRAM_BLOCK_ID and WEBAPP_ENABLED and WEBAPP_URL and not STREAM_ONLY)
 # Paste this into AdsGram -> ad unit -> "Reward URL" (also shown in /settings -> Verification).

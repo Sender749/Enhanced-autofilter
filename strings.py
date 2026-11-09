@@ -92,6 +92,12 @@ VERIFY_BTN = "🔐 Verify Now"
 VERIFY_TUTORIAL_BTN = "📖 How to Verify"
 VERIFY_DONE_TXT = "✅ Verification complete! Tap below to get your file."
 VERIFY_GET_FILE_BTN = "📥 Get my file"
+AD_VERIFY_PROMPT_TXT = (
+    "👋 <b>Hey {mention}!</b>\n\n"
+    "📌 Verification (step {tier}/3): watch one short ad and I'll send your file automatically.\n"
+    "Tap <b>Verify Now</b> below."
+)
+AD_VERIFY_BTN = "✅ Verify Now (Watch Ad)"
 VERIFY_EXPIRED_TXT = "⚠️ This verification link has expired or was already used. Please request the file again."
 
 # ── Premium ────────────────────────────────────────────────────────────────────

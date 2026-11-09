@@ -186,12 +186,17 @@ WEBAPP_SYNC_SECONDS = int(os.environ.get("WEBAPP_SYNC_SECONDS", "600"))  # how o
 
 # ── AdsGram rewarded-ad verification (webapp/adverify.py) ───────────────────
 # ADSGRAM_BLOCK_ID = the Reward ad unit's id from partner.adsgram.ai ("<> Show code" -> Copy BlockID).
-ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "58841").strip()
+ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "").strip().strip("\"'").strip()  # digits only, e.g. 12345
 # Secret inside the Reward URL so only AdsGram can confirm a watched ad. Empty = made from BOT_TOKEN.
 ADSGRAM_SECRET = os.environ.get("ADSGRAM_SECRET", "").strip() or hashlib.sha256(f"adsgram|{BOT_TOKEN}".encode()).hexdigest()[:24]
 # True = a user is verified only after AdsGram's server also confirms the ad (needs the Reward URL set in
 # AdsGram). Set false only while testing on an AdsGram *Test platform* (it sends no confirmation).
-ADSGRAM_REQUIRE_REWARD = _bool("ADSGRAM_REQUIRE_REWARD", False)
+ADSGRAM_REQUIRE_REWARD = _bool("ADSGRAM_REQUIRE_REWARD", True)
+# TEST ONLY: true = AdsGram returns a TEST ad even without moderation/fill, so you can check the setup works.
+# AdsGram sends no confirmation for test ads, so verification skips that check while this is on. Turn it off for real use.
+ADSGRAM_DEBUG_ADS = _bool("ADSGRAM_DEBUG_ADS", False)
+# true = the page shows AdsGram's error reason under "No ad available" (useful while setting up; set false later).
+ADSGRAM_SHOW_ERRORS = _bool("ADSGRAM_SHOW_ERRORS", True)
 ADSGRAM_WAIT_SECONDS = int(os.environ.get("ADSGRAM_WAIT_SECONDS", "12"))  # how long to wait for that confirmation
 ADSGRAM_ENABLED = bool(ADSGRAM_BLOCK_ID and WEBAPP_ENABLED and WEBAPP_URL and not STREAM_ONLY)
 # Paste this into AdsGram -> ad unit -> "Reward URL" (also shown in /settings -> Verification).

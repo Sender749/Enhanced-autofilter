@@ -8,7 +8,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import RPCError, UserNotParticipant, ListenerTimeout, ListenerStopped
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import ADMINS, MOVIE_UPDATE_CHANNEL
+from config import ADMINS, MOVIE_UPDATE_CHANNEL, ADSGRAM_ENABLED, ADSGRAM_REWARD_URL
 from database.settings_db import (
     get_settings, update_settings, set_shortener, set_tutorial,
     add_fsub_channel, remove_fsub_channel,
@@ -262,7 +262,23 @@ def build_verify_menu(settings: dict):
     )
     body += f"\n⏱ Gap 1→2: <code>{settings['verify_time']}s</code>\n⏱ Gap 2→3: <code>{settings['third_verify_time']}s</code>"
     text = VERIFY_MENU_HEADER.format(body=body)
-    rows = [[InlineKeyboardButton("⬅️ Back", callback_data="cfg#main")]]
+
+    # How users verify: AdsGram rewarded ad (webapp/adverify.py) or the shortener tiers above.
+    ad_mode = settings.get("verify_mode") == "ad"
+    mode_txt = "📺 <b>Mode: Watch Ad (AdsGram)</b>" if ad_mode else "🔗 <b>Mode: Shortener</b>"
+    if ad_mode and not ADSGRAM_ENABLED:
+        mode_txt += "\n⚠️ AdsGram isn't set up yet (add <code>ADSGRAM_BLOCK_ID</code> in the host's environment), so the shortener is used for now."
+    mode_txt += (
+        "\n\n<b>AdsGram Reward URL</b> (paste into your AdsGram ad unit):\n"
+        f"<code>{html.escape(ADSGRAM_REWARD_URL)}</code>\n"
+        "If a user's ad can't load, they get the shortener link for their tier instead."
+    )
+    text = mode_txt + "\n\n" + text
+
+    rows = [
+        [InlineKeyboardButton("🔗 Switch to Shortener" if ad_mode else "📺 Switch to Watch Ad", callback_data="cfg#vmode")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="cfg#main")],
+    ]
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -345,6 +361,15 @@ async def settings_callback(bot, query):
             "Choose whether search results show as tappable buttons or a plain text list.",
             show_alert=True,
         )
+        return
+
+    if action == "vmode":  # Verification menu: Shortener <-> Watch Ad
+        settings = await get_settings()
+        new_mode = "shortener" if settings.get("verify_mode") == "ad" else "ad"
+        settings = await update_settings({"verify_mode": new_mode})
+        text, markup = build_verify_menu(settings)
+        await query.answer("Users now verify by watching an ad." if new_mode == "ad" else "Users now verify with the shortener.")
+        await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         return
 
     if action == "m":

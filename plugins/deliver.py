@@ -21,8 +21,9 @@ import logging
 
 from pyrogram import Client, filters
 from pyrogram.errors import RPCError
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 
+from config import ADSGRAM_ENABLED, WEBAPP_URL
 from database.filters_db import get_file_by_id, display_name
 from database.premium_db import has_premium_access
 from database.settings_db import get_settings
@@ -37,6 +38,7 @@ from strings import (
     FILE_NOT_FOUND_TXT, FILE_SEND_CAPTION, FILE_SEND_CAPTION_WITH_LIMIT,
     FSUB_REQUIRED_TXT, TRY_AGAIN_BTN,
     VERIFY_PROMPT_TXT, VERIFY_BTN, VERIFY_TUTORIAL_BTN,
+    AD_VERIFY_PROMPT_TXT, AD_VERIFY_BTN,
     FILE_AUTODELETE_NOTICE, FILE_AUTODELETE_DONE,
 )
 
@@ -144,6 +146,24 @@ async def _schedule_file_delete(bot, sent_message, seconds: int):
 async def _send_verify_prompt(bot, user_id: int, tier: int, file_id: str, settings: dict):
     token = await create_token(user_id, tier, file_id)
     record_verify_prompt(tier)          # daily stats (/stats panel)
+
+    try:
+        mention = (await bot.get_users(user_id)).mention
+    except RPCError:
+        mention = f"user {user_id}"
+
+    # Ad mode: a Mini App button that plays an AdsGram rewarded ad (webapp/adverify.py).
+    # Falls back to the shortener below when AdsGram isn't configured (no ADSGRAM_BLOCK_ID).
+    if settings.get("verify_mode") == "ad" and ADSGRAM_ENABLED:
+        await bot.send_message(
+            user_id,
+            AD_VERIFY_PROMPT_TXT.format(mention=mention, tier=tier),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                AD_VERIFY_BTN, web_app=WebAppInfo(url=f"{WEBAPP_URL}/verify?t={token}"),
+            )]]),
+        )
+        return
+
     shortener = settings["shorteners"].get(str(tier), {})
     long_url = f"https://t.me/{temp.U_NAME}?start=notcopy_{token}"
     short_url = await make_short_link(long_url, shortener.get("domain", ""), shortener.get("api", ""))
@@ -152,11 +172,6 @@ async def _send_verify_prompt(bot, user_id: int, tier: int, file_id: str, settin
     tutorial = settings["tutorials"].get(str(tier), "")
     if tutorial:
         buttons.append([InlineKeyboardButton(VERIFY_TUTORIAL_BTN, url=tutorial)])
-
-    try:
-        mention = (await bot.get_users(user_id)).mention
-    except RPCError:
-        mention = f"user {user_id}"
 
     await bot.send_message(
         user_id,

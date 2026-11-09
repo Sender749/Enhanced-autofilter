@@ -20,7 +20,10 @@ import logging
 
 from aiohttp import web
 
-from config import ADSGRAM_BLOCK_ID, ADSGRAM_SECRET, ADSGRAM_REQUIRE_REWARD, ADSGRAM_WAIT_SECONDS
+from config import (
+    ADSGRAM_BLOCK_ID, ADSGRAM_SECRET, ADSGRAM_REQUIRE_REWARD, ADSGRAM_WAIT_SECONDS,
+    ADSGRAM_DEBUG_ADS, ADSGRAM_SHOW_ERRORS,
+)
 from database.settings_db import get_settings
 from database.verify_db import peek_token, consume_token, mark_verified, record_ad_reward, wait_ad_reward
 from log_utils import log_user_verified
@@ -52,6 +55,7 @@ _PAGE = """<!doctype html>
          background:var(--btn);color:var(--btnfg);margin-top:10px}
   button.ghost{background:transparent;color:var(--btn);border:1px solid var(--btn)}
   button:disabled{opacity:.55}
+  .dbg{margin:14px 0 0;font-size:12px;color:var(--hint);word-break:break-word;text-align:left}
 </style></head>
 <body><div class="card">
   <div class="icon" id="ic">🎬</div>
@@ -59,21 +63,27 @@ _PAGE = """<!doctype html>
   <p id="m">Watch one short ad to continue. It takes about 15–30 seconds, then your file is sent automatically.</p>
   <button id="go">▶ Watch Ad</button>
   <button id="alt" class="ghost" style="display:none"></button>
+  <p class="dbg" id="d"></p>
 </div>
 <script>
 const tg = (window.Telegram && Telegram.WebApp) || {initData:"",ready(){},expand(){},close(){},openLink(u){location.href=u}};
 tg.ready(); tg.expand && tg.expand();
 const BLOCK = __BLOCK__;
+const SHOW_ERR = __SHOWERR__;
+const DEBUG_ADS = __DEBUGADS__;
 const TOKEN = new URLSearchParams(location.search).get("t") || "";
 const $ = id => document.getElementById(id);
-let ctrl = null, mode = "watch", busy = false;
-try { ctrl = window.Adsgram ? window.Adsgram.init({blockId: BLOCK}) : null; } catch (e) { ctrl = null; }
+let ctrl = null, mode = "watch", busy = false, initErr = "";
+try {
+  if (!window.Adsgram) { initErr = "AdsGram script did not load"; }
+  else { ctrl = window.Adsgram.init(DEBUG_ADS ? {blockId: BLOCK, debug: true, debugBannerType: "RewardedVideo"} : {blockId: BLOCK}); }
+} catch (e) { ctrl = null; initErr = "init failed: " + ((e && e.message) || e); }
 
 function say(icon, title, msg){ $("ic").textContent = icon; $("t").textContent = title; $("m").textContent = msg; }
 function setGo(label, m, show = true){ $("go").textContent = label; $("go").style.display = show ? "" : "none"; mode = m; }
-async function post(path){
+async function post(path, extra){
   try {
-    const r = await fetch(path, {method:"POST", headers:{"X-Init-Data": tg.initData || "", "Content-Type":"application/json"}, body: JSON.stringify({t: TOKEN})});
+    const r = await fetch(path, {method:"POST", headers:{"X-Init-Data": tg.initData || "", "Content-Type":"application/json"}, body: JSON.stringify(Object.assign({t: TOKEN}, extra || {}))});
     return await r.json();
   } catch (e) { return {ok:false, error:"server"}; }
 }
@@ -99,8 +109,11 @@ async function confirmAd(){
   }
 }
 
-async function fallback(){
-  const j = await post("/api/adfallback");
+async function fallback(why){
+  why = String(why || "unknown").slice(0, 300);
+  console.log("AdsGram fallback:", why);
+  $("d").textContent = SHOW_ERR ? "Reason: " + why : "";
+  const j = await post("/api/adfallback", {why: why});
   if (j.ok) {
     say("ℹ️", "No ad available", "Use the backup verification link instead.");
     setGo("", "done", false);
@@ -118,7 +131,7 @@ async function fallback(){
 
 async function watch(){
   if (!TOKEN) { say("⚠️", "Invalid link", "Go back to the bot and request the file again."); setGo("", "done", false); return; }
-  if (!ctrl) { return fallback(); }
+  if (!ctrl) { return fallback(initErr || "no ad controller"); }
   try {
     await ctrl.show();
   } catch (res) {
@@ -128,7 +141,11 @@ async function watch(){
       setGo("▶ Watch Ad again", "watch");
       return;
     }
-    return fallback();
+    let why;
+    try { why = (res && typeof res === "object" && ("state" in res || "description" in res))
+      ? JSON.stringify({error: res.error, state: res.state, description: res.description}) : String(res && res.message || res); }
+    catch (e) { why = "unreadable error"; }
+    return fallback(why);
   }
   await confirmAd();
 }
@@ -143,7 +160,10 @@ $("go").onclick = async () => {
 
 
 async def page(request: web.Request):
-    html = _PAGE.replace("__BLOCK__", json.dumps(ADSGRAM_BLOCK_ID).replace("</", "<\\/"))
+    logger.info("AdsGram verify page opened")
+    html = (_PAGE.replace("__BLOCK__", json.dumps(ADSGRAM_BLOCK_ID).replace("</", "<\\/"))
+            .replace("__SHOWERR__", "true" if ADSGRAM_SHOW_ERRORS else "false")
+            .replace("__DEBUGADS__", "true" if ADSGRAM_DEBUG_ADS else "false"))
     return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
 
@@ -152,25 +172,28 @@ def _json(data: dict, status: int = 200):
 
 
 async def _read(request: web.Request):
-    """-> (telegram user id, token) or (None, None) when the request isn't from the Mini App."""
+    """-> (telegram user id, token, body) or (None, None, {}) when the request isn't from the Mini App."""
     user = validate_init_data(request.headers.get("X-Init-Data", ""))
     if not user:
-        return None, None
+        return None, None, {}
     try:
         body = await request.json()
     except Exception:
         body = {}
-    return int(user["id"]), str(body.get("t", "")).strip()
+    return int(user["id"]), str(body.get("t", "")).strip(), body
 
 
 async def api_verify(request: web.Request):
-    uid, token = await _read(request)
+    uid, token, body = await _read(request)
     if uid is None:
         return _json({"ok": False, "error": "auth"}, 401)
     if not token or not await peek_token(token, uid):
         return _json({"ok": False, "error": "expired"})
 
-    if ADSGRAM_REQUIRE_REWARD and not await wait_ad_reward(uid, ADSGRAM_WAIT_SECONDS):
+    # Test ads (ADSGRAM_DEBUG_ADS) never trigger AdsGram's confirmation call, so skip that check for them.
+    if ADSGRAM_REQUIRE_REWARD and not ADSGRAM_DEBUG_ADS and not await wait_ad_reward(uid, ADSGRAM_WAIT_SECONDS):
+        logger.warning("User %s finished an ad but AdsGram's server confirmation never arrived "
+                       "(is the Reward URL pasted in the AdsGram ad unit? is the ad unit approved?)", uid)
         return _json({"ok": False, "error": "not_confirmed"})
 
     doc = await consume_token(token, uid)
@@ -207,12 +230,13 @@ async def _finish(uid: int, doc: dict):
 
 async def api_fallback(request: web.Request):
     """No ad for this user -> hand out the old shortener link for the tier they need."""
-    uid, token = await _read(request)
+    uid, token, body = await _read(request)
     if uid is None:
         return _json({"ok": False, "error": "auth"}, 401)
     doc = await peek_token(token, uid) if token else None
     if not doc:
         return _json({"ok": False, "error": "expired"})
+    logger.warning("AdsGram ad could not be shown to user %s: %s", uid, str(body.get("why", ""))[:300])
 
     shortener = (await get_settings())["shorteners"].get(str(doc["tier"]), {})
     domain, api = shortener.get("domain", ""), shortener.get("api", "")
